@@ -6,6 +6,7 @@ from flask import Flask, render_template, Response, jsonify
 import threading
 from flask_cors import CORS
 import warnings
+import os  # Asegúrate de importar os si aún no lo has hecho
 
 ###############################################################################
 #                        IGNORAR LOS FUTUREWARNING DE TORCH                   #
@@ -20,7 +21,7 @@ IOU_THRESHOLD = 0.5          # Umbral para NMS
 CONSENSUS_COUNT = 5          # Cantidad de lecturas similares para confirmar detección
 MAX_BUFFER_SIZE = 10         # Tamaño máximo del buffer de lecturas
 
-CAMERA_INDEX = 2             # Índice de la cámara (ajusta según tu sistema)
+CAMERA_INDEX = 0           # Índice de la cámara (ajusta según tu sistema)
 DETECT_ACTIVE = False
 LOCK = threading.Lock()
 
@@ -48,11 +49,13 @@ DETECTION_BUFFER = {
 ###############################################################################
 def load_local_model(pt_file: str):
     """
-    Carga un modelo YOLOv5 local (sin conexión a internet) desde ./yolov5
+    Carga un modelo YOLOv5 local (sin conexión a internet) desde una ruta específica
     usando torch.hub.load con source='local'.
     """
+    if not os.path.exists(pt_file):
+        raise FileNotFoundError(f"El modelo no se encontró en la ruta: {pt_file}")
     return torch.hub.load(
-        './yolov5',
+        './yolov5',  # Asegúrate de que la ruta a yolov5 sea correcta
         'custom',
         path=pt_file,
         source='local',
@@ -180,15 +183,19 @@ def is_any_valid(medidor, new_str):
 ###############################################################################
 #                               CARGA DE MODELOS                               #
 ###############################################################################
-# Cargar modelos principales
-display_model = load_local_model('modelos_display/Display.pt')
-display_4_model = load_local_model('modelos_display/Display_4.pt')
+# Definir rutas de las carpetas
+DISPLAY_MODELS_DIR = 'modelos_display'
+NUMERIC_MODELS_DIR = 'modelos_numericos'
 
-# Cargar submodelos
-analogico_model = load_local_model('modelos_numericos/Analogico.pt')
-negro_model = load_local_model('modelos_numericos/ult.pt')  # Asegúrate de que el nombre es correcto
-metal_model = load_local_model('modelos_numericos/metal.pt')
-medidor_especial_model = load_local_model('modelos_numericos/medidor_especial.pt')  # Submodelo para Medidor_4
+# Cargar modelos principales desde 'modelos_display'
+display_model = load_local_model(os.path.join(DISPLAY_MODELS_DIR, 'Display.pt'))
+display_4_model = load_local_model(os.path.join(DISPLAY_MODELS_DIR, 'Display_4.pt'))
+
+# Cargar submodelos desde 'modelos_numericos'
+analogico_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'Analogico.pt'))
+negro_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'ult.pt'))  # Asegúrate de que el nombre es correcto
+metal_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'metal.pt'))
+medidor_especial_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'medidor_especial.pt'))  # Submodelo para Medidor_4
 
 # Asociar modelos con medidores
 MEDIDOR_TO_MODEL = {
@@ -337,9 +344,15 @@ def detect_display(frame):
             dets_sorted = sorted(dets, key=lambda dd: dd['box'][0])
             new_digits = ''.join(dd['class'] for dd in dets_sorted)
 
-            # Ignorar si aparece "10" en Medidor_4
+            # Manejar detecciones de clase '10'
             if '10' in new_digits:
-                continue  # Ignorar detección
+                # Dibujar ROI y etiqueta indicando que se detectó '10'
+                cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (0,0,255), 2)  # Rojo para indicar problema
+                cv2.putText(roi, 'Clase 10 detectada', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+                rois.append(roi)  # Agregar la ROI sin añadir al buffer ni historial
+                # Guardar la ROI para excluirla en Display.pt
+                medidor_4_rois.append([x1, y1, x2, y2])
+                continue  # No agregar al buffer ni al historial
             else:
                 # Validar y confirmar
                 if is_any_valid('Medidor_4', new_digits):
@@ -398,46 +411,52 @@ def detect_display(frame):
 
         # Aplicar el submodelo correspondiente
         submodel = MEDIDOR_TO_MODEL.get(class_name)
-        if not submodel:
-            continue
+        if submodel:
+            # Detectar dígitos con el submodelo
+            sub_results = submodel(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+            dets = []
+            for d in sub_results.xyxy[0]:
+                xa1, ya1, xa2, yb2, conf_sub, cls_sub = d
+                if conf_sub >= CONFIDENCE_THRESHOLD:
+                    cls_name = submodel.names[int(cls_sub)]
+                    dets.append({
+                        'class': cls_name,
+                        'box': [int(xa1), int(ya1), int(xa2), int(yb2)],
+                        'confidence': float(conf_sub)
+                    })
+            dets = nms(dets, iou_thres=IOU_THRESHOLD)
+            dets_sorted = sorted(dets, key=lambda dd: dd['box'][0])
+            new_digits = ''.join(dd['class'] for dd in dets_sorted)
 
-        sub_results = submodel(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
-        dets = []
-        for d in sub_results.xyxy[0]:
-            xa1, ya1, xa2, yb2, conf_sub, cls_sub = d
-            if conf_sub >= CONFIDENCE_THRESHOLD:
-                cls_name = submodel.names[int(cls_sub)]
-                dets.append({
-                    'class': cls_name,
-                    'box': [int(xa1), int(ya1), int(xa2), int(yb2)],
-                    'confidence': float(conf_sub)
-                })
-        dets = nms(dets, iou_thres=IOU_THRESHOLD)
-        dets_sorted = sorted(dets, key=lambda dd: dd['box'][0])
-        new_digits = ''.join(dd['class'] for dd in dets_sorted)
+            # Manejar detecciones de clase '10'
+            if '10' in new_digits:
+                # Dibujar ROI y etiqueta indicando que se detectó '10'
+                cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (0,0,255), 2)  # Rojo para indicar problema
+                cv2.putText(roi, 'Clase 10 detectada', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+                rois.append(roi)  # Agregar la ROI sin añadir al buffer ni historial
+                continue  # No agregar al buffer ni al historial
+            else:
+                # Validar y confirmar
+                if is_any_valid(class_name, new_digits):
+                    DETECTION_BUFFER[class_name].append(new_digits)
+                    if len(DETECTION_BUFFER[class_name]) > MAX_BUFFER_SIZE:
+                        DETECTION_BUFFER[class_name].pop(0)
 
-        # Ignorar si aparece "10"
-        if '10' in new_digits:
-            continue  # Ignorar detección
-        else:
-            # Validar y confirmar
-            if is_any_valid(class_name, new_digits):
-                DETECTION_BUFFER[class_name].append(new_digits)
-                if len(DETECTION_BUFFER[class_name]) > MAX_BUFFER_SIZE:
-                    DETECTION_BUFFER[class_name].pop(0)
-
-                confirmed_value = check_consensus(
-                    DETECTION_BUFFER[class_name],
-                    required_count=CONSENSUS_COUNT
-                )
-                if confirmed_value:
-                    HISTORY[class_name].append(confirmed_value)
-                    print(f"[CONSOLE] {class_name} => {confirmed_value}")
-                    DETECTION_BUFFER[class_name].clear()
+                    confirmed_value = check_consensus(
+                        DETECTION_BUFFER[class_name],
+                        required_count=CONSENSUS_COUNT
+                    )
+                    if confirmed_value:
+                        HISTORY[class_name].append(confirmed_value)
+                        print(f"[CONSOLE] {class_name} => {confirmed_value}")
+                        DETECTION_BUFFER[class_name].clear()
 
         # Dibujar ROI y etiqueta
+        if '10' in new_digits:
+            cv2.putText(roi, 'Clase 10 detectada', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+        else:
+            cv2.putText(roi, class_name, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
         cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (0,255,0), 2)
-        cv2.putText(roi, class_name, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
         rois.append(roi)
 
     return rois
