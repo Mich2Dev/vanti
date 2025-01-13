@@ -2,7 +2,7 @@ import cv2
 import torch
 import numpy as np
 import statistics
-from flask import Flask, render_template, Response, jsonify, request
+from flask import Flask, render_template, Response, jsonify
 import threading
 from flask_cors import CORS
 import warnings
@@ -13,45 +13,29 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 ###############################################################################
-#                             CONFIGURACIONES                                 #
+#                           CONFIGURACIÓN GENERAL                             #
 ###############################################################################
-# Umbral de confianza para detectar el DISPLAY (Medidor_1..3 o Medidor_4)
-DISPLAY_CONFIDENCE_THRESHOLD = 0.9
-IOU_THRESHOLD = 0.9  # <--- Asegúrate de definirlo
+CONFIDENCE_THRESHOLD = 0.5   # Umbral de confianza para submodelos
+IOU_THRESHOLD = 0.5          # Umbral para NMS
+CONSENSUS_COUNT = 5          # Cantidad de lecturas similares para confirmar detección
+MAX_BUFFER_SIZE = 10         # Tamaño máximo del buffer de lecturas
 
-# Umbral de confianza para los SUBMODELOS de dígitos
-SUBMODEL_CONFIDENCE_THRESHOLD = 0.6
-
-# Validaciones y Buffer
-CONSENSUS_COUNT = 5
-MAX_BUFFER_SIZE = 10
-
-# Validaciones (Progresiva y Estadística)
-MAX_PROG_JUMP = 2
-WINDOW_SIZE = 10
-K_STD = 3
-
-# Cámara y estado de la detección
-CAMERA_INDEX = 2
+CAMERA_INDEX = 2             # Índice de la cámara (ajusta según tu sistema)
 DETECT_ACTIVE = False
 LOCK = threading.Lock()
 
 ###############################################################################
-#                ESTADO TIPO 4 (LOCK) PARA EVITAR SALTOS                      #
+#                 HISTORIAL Y BUFFERS PARA CADA MEDIDOR                       #
 ###############################################################################
-LOCKED_MEDIDOR_4 = False  # Indica si estamos "fijados" en medidor tipo 4
-LOCK_FRAMES_4 = 0         # Cuántos frames mantenemos el lock
-LOCK_THRESHOLD = 10       # Si detectamos 4, fijar por 10 frames
-
-###############################################################################
-#          HISTORIAL Y BUFFERS PARA CADA MEDIDOR (1,2,3,4)                    #
-###############################################################################
+# Almacenamos todas las lecturas confirmadas
 HISTORY = {
-    'Medidor_1': [],
+    'Medidor_1': [], 
     'Medidor_2': [],
     'Medidor_3': [],
     'Medidor_4': []
 }
+
+# Buffer temporal donde se guardan lecturas hasta que se cumpla el consenso
 DETECTION_BUFFER = {
     'Medidor_1': [],
     'Medidor_2': [],
@@ -60,7 +44,7 @@ DETECTION_BUFFER = {
 }
 
 ###############################################################################
-#                         FUNCIONES AUXILIARES                                #
+#                            FUNCIONES AUXILIARES                             #
 ###############################################################################
 def load_local_model(pt_file: str):
     """
@@ -76,21 +60,24 @@ def load_local_model(pt_file: str):
     )
 
 def iou(boxA, boxB):
+    """Cálculo simple de Intersection Over Union (IOU)."""
     xA = max(boxA[0], boxB[0])
     yA = max(boxA[1], boxB[1])
     xB = min(boxA[2], boxB[2])
     yB = min(boxA[3], boxB[3])
+
     inter_w = max(0, xB - xA)
     inter_h = max(0, yB - yA)
     inter_area = inter_w * inter_h
+
     areaA = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
     areaB = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
     union_area = areaA + areaB - inter_area
-    if union_area == 0:
-        return 0.0
-    return inter_area / union_area
+
+    return 0.0 if union_area == 0 else inter_area / union_area
 
 def nms(detections, iou_thres=0.5):
+    """Non-Maximum Suppression básico."""
     if not detections:
         return []
     detections = sorted(detections, key=lambda d: d['confidence'], reverse=True)
@@ -99,40 +86,65 @@ def nms(detections, iou_thres=0.5):
         best = detections.pop(0)
         final.append(best)
         detections = [
-            d for d in detections
+            d for d in detections 
             if iou(best['box'], d['box']) < iou_thres
         ]
     return final
 
 def check_consensus(buffer_list, required_count=5):
+    """
+    Verifica si en buffer_list hay un consenso >= required_count.
+    - Si todas las últimas 'required_count' lecturas son iguales => confirmamos.
+    """
     if len(buffer_list) < required_count:
         return None
+
+    # Tomar solo las últimas 'required_count'
     last_values = buffer_list[-required_count:]
+
+    # Verificar si todas son idénticas
     if all(v == last_values[0] for v in last_values):
-        return last_values[-1]
+        return last_values[-1]  # la última detección se confirma
+
     return None
 
 ###############################################################################
-#                          VALIDACIONES                                       #
+#             FUNCIONES DE VALIDACIÓN (SE ACEPTA SI ALGUNA ES TRUE)           #
 ###############################################################################
 def is_progressive_valid(medidor, new_str):
-    if not HISTORY[medidor]:
-        return True
+    """
+    Validación 1: Chequeo progresivo (evita saltos muy grandes).
+    - Si no hay detecciones confirmadas, se acepta provisionalmente.
+    - Si hay una anterior, permite un salto de ±2 (puedes ajustar).
+    """
+    if not HISTORY[medidor]: 
+        return True  # Nada previo => no tenemos con qué comparar
+
     try:
         old_val = int(HISTORY[medidor][-1])
         new_val = int(new_str)
     except ValueError:
         return False
-    return abs(new_val - old_val) <= MAX_PROG_JUMP
 
-def is_adaptive_range_valid(medidor, new_str, window=WINDOW_SIZE, k=K_STD):
+    # Aquí permitimos ±2, ajusta si deseas más rango
+    return abs(new_val - old_val) <= 2
+
+def is_adaptive_range_valid(medidor, new_str, window=10, k=3):
+    """
+    Validación 2: Rango adaptativo basado en estadísticas del historial.
+    - Toma las últimas 'window' lecturas confirmadas
+    - Calcula media y desviación estándar
+    - Permite new_val dentro de (media ± k*desviación).
+    """
     if not HISTORY[medidor]:
-        return True
+        return True  # Si no hay historial, no hay rango => lo aceptamos
+
     try:
         new_val = int(new_str)
     except ValueError:
         return False
 
+    # Tomar las últimas 'window' lecturas
     recent = HISTORY[medidor][-window:]
     if not recent:
         return True
@@ -143,47 +155,55 @@ def is_adaptive_range_valid(medidor, new_str, window=WINDOW_SIZE, k=K_STD):
             vals_int.append(int(v))
         except ValueError:
             pass
+
     if not vals_int:
         return True
 
     media = statistics.mean(vals_int)
-    stdev = statistics.pstdev(vals_int) if len(vals_int) > 1 else 0
+    stdev = statistics.pstdev(vals_int)  # o stdev
     if stdev == 0:
+        # Si todas eran iguales, stdev=0 => permitir algo de rango
         stdev = 1
-    rango_min = media - k*stdev
-    rango_max = media + k*stdev
+
+    rango_min = media - k * stdev
+    rango_max = media + k * stdev
+
     return (rango_min <= new_val <= rango_max)
 
 def is_any_valid(medidor, new_str):
     """
-    Se acepta si pasa la validación progresiva o la adaptativa.
+    Se acepta si CUALQUIERA de las validaciones (progresiva o rango adaptativo) es True.
     """
     return is_progressive_valid(medidor, new_str) or \
-           is_adaptive_range_valid(medidor, new_str)
+           is_adaptive_range_valid(medidor, new_str, window=10, k=3)
 
 ###############################################################################
-#                  CARGA DE MODELOS PRINCIPALES                               #
+#                               CARGA DE MODELOS                               #
 ###############################################################################
-display_model = load_local_model('Display.pt')      # Medidor_1,2,3
-analogico_model = load_local_model('Analogico.pt')
-ult_model       = load_local_model('ult.pt')
-metal_model     = load_local_model('metal.pt')
+# Cargar modelos principales
+display_model = load_local_model('modelos_display/Display.pt')
+display_4_model = load_local_model('modelos_display/Display_4.pt')
 
-display4_model  = load_local_model('Display_4.pt')  # Medidor_4 + rf4
-digits4_model   = load_local_model('medidor_especial.pt')  # 0..9,10(rechazo),11=>6
+# Cargar submodelos
+analogico_model = load_local_model('modelos_numericos/Analogico.pt')
+negro_model = load_local_model('modelos_numericos/ult.pt')  # Asegúrate de que el nombre es correcto
+metal_model = load_local_model('modelos_numericos/metal.pt')
+medidor_especial_model = load_local_model('modelos_numericos/medidor_especial.pt')  # Submodelo para Medidor_4
 
+# Asociar modelos con medidores
 MEDIDOR_TO_MODEL = {
     'Medidor_1': analogico_model,
-    'Medidor_2': ult_model,
-    'Medidor_3': metal_model
-    # Podrías mapear 'Medidor_4': digits4_model si quisieras un approach “automático”
+    'Medidor_2': negro_model,
+    'Medidor_3': metal_model,
+    'Medidor_4': medidor_especial_model  # Asociamos Medidor_4 con su submodelo especial
 }
 
 ###############################################################################
-#                         APLICACIÓN FLASK                                    #
+#                             APLICACIÓN FLASK                                #
 ###############################################################################
 app = Flask(__name__)
 CORS(app)
+
 cap = cv2.VideoCapture(CAMERA_INDEX)
 
 @app.route('/')
@@ -197,34 +217,32 @@ def video_feed():
         mimetype='multipart/x-mixed-replace; boundary=frame'
     )
 
-@app.route('/start', methods=['GET','POST'])
+@app.route('/start', methods=['GET'])
 def start_detection():
     global DETECT_ACTIVE
     with LOCK:
         DETECT_ACTIVE = True
-    return jsonify({'status': 'detección iniciada (GET/POST)'})
+    return jsonify({'status': 'detección iniciada'})
 
-@app.route('/stop', methods=['GET','POST'])
+@app.route('/stop', methods=['GET'])
 def stop_detection():
+    """
+    Al detener la detección, RESETEAMOS los valores:
+    - Se limpia HISTORY y DETECTION_BUFFER
+    - Se pone DETECT_ACTIVE en False
+    """
     global DETECT_ACTIVE
     with LOCK:
         DETECT_ACTIVE = False
-        # Resetea buffers e historial
-        for m in DETECTION_BUFFER:
-            DETECTION_BUFFER[m].clear()
-        for m in HISTORY:
-            HISTORY[m].clear()
-    return jsonify({'status': 'detección detenida (GET/POST), reseteada'})
-
-###############################################################################
-#                    LOCK Y GENERATE_FRAMES                                  #
-###############################################################################
-LOCKED_MEDIDOR_4 = False
-LOCK_FRAMES_4 = 0
-LOCK_THRESHOLD = 10
+        # Resetear buffers e historial
+        for medidor in DETECTION_BUFFER:
+            DETECTION_BUFFER[medidor].clear()
+        for medidor in HISTORY:
+            HISTORY[medidor].clear()
+    return jsonify({'status': 'detección detenida y valores reseteados'})
 
 def generate_frames():
-    global LOCKED_MEDIDOR_4, LOCK_FRAMES_4
+    global DETECT_ACTIVE
     while True:
         success, frame = cap.read()
         if not success:
@@ -233,32 +251,8 @@ def generate_frames():
             active = DETECT_ACTIVE
 
         if active:
-            if LOCKED_MEDIDOR_4:
-                # Ya estamos lockeados en Medidor_4 => revalidar
-                rois_4, still_4 = detect_display4(frame)
-                if still_4:
-                    # renovamos lock
-                    LOCK_FRAMES_4 = LOCK_THRESHOLD
-                    rois_final = rois_4
-                else:
-                    # se reduce
-                    LOCK_FRAMES_4 -= 1
-                    if LOCK_FRAMES_4 <= 0:
-                        LOCKED_MEDIDOR_4 = False
-                    rois_final = rois_4  # mientras tanto, seguimos en "4"
-            else:
-                # Aun no estamos lockeados en 4 => checar si aparece 4
-                rois_4, found_4 = detect_display4(frame)
-                if found_4:
-                    LOCKED_MEDIDOR_4 = True
-                    LOCK_FRAMES_4 = LOCK_THRESHOLD
-                    rois_final = rois_4
-                else:
-                    # Detectar medidor_1..3
-                    rois_123 = detect_display123(frame)
-                    rois_final = rois_123
-
-            combined = combine_rois(rois_final)
+            rois = detect_display(frame)
+            combined = combine_rois(rois)
             ret, buffer = cv2.imencode('.jpg', combined)
             frame_bytes = buffer.tobytes()
         else:
@@ -269,187 +263,190 @@ def generate_frames():
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
 ###############################################################################
-#                DETECCIÓN DE MEDIDOR_4 (DISPLAY_4, rf4)                     #
+#                           FUNCIÓN PRINCIPAL DE DETECCIÓN                    #
 ###############################################################################
-def detect_display4(frame):
+def detect_display(frame):
     """
-    Busca Medidor_4 y rf4 con un threshold de confianza en la detección de display.
-    Solo si ambos => found_4 = True. Aplica detect_subdigits_4 en la ROI de Medidor_4.
+    1. Detecta todas las instancias de rf4 usando Display_4.pt.
+    2. Detecta Medidor_4 usando Display_4.pt.
+    3. Si al menos un rf4 está presente, procesa las detecciones de Medidor_4.
+    4. Excluye las ROIs de Medidor_4 de las detecciones de Display.pt para evitar confusiones con otros medidores.
+    5. Procesa las detecciones de Medidor_1, Medidor_2 y Medidor_3 usando Display.pt.
+    6. Solo imprime en consola los valores confirmados.
     """
-    results = display4_model(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    # Extraer
-    labels = results.xyxyn[0][:, -1].cpu().numpy()
-    boxes  = results.xyxyn[0][:, :-1].cpu().numpy()
-
+    rois = []
     ih, iw, _ = frame.shape
-    rois_4 = []
-    found_4 = False
 
-    found_medidor4 = False
-    found_rf4 = False
+    # Paso 1: Detectar rf4 usando Display_4.pt
+    results_rf4 = display_4_model(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    labels_rf4 = results_rf4.xyxyn[0][:, -1].cpu().numpy()
+    boxes_rf4  = results_rf4.xyxyn[0][:, :-1].cpu().numpy()
 
-    for label, box in zip(labels, boxes):
-        class_index = int(label)
-        class_name = display4_model.names[class_index]
+    rf4_present = False
+    for label, box in zip(labels_rf4, boxes_rf4):
+        class_id = int(label)
+        class_name = display_4_model.names[class_id]
+        if class_name == 'rf4':
+            rf4_present = True
+            break  # Solo necesita al menos un rf4
+
+    # Paso 2: Detectar Medidor_4 usando Display_4.pt
+    results_medidor_4 = display_4_model(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    labels_medidor_4 = results_medidor_4.xyxyn[0][:, -1].cpu().numpy()
+    boxes_medidor_4  = results_medidor_4.xyxyn[0][:, :-1].cpu().numpy()
+
+    medidor_4_rois = []
+
+    if rf4_present:
+        for label, box in zip(labels_medidor_4, boxes_medidor_4):
+            class_id = int(label)
+            class_name = display_4_model.names[class_id]
+            if class_name != 'Medidor_4':
+                continue  # Solo procesar Medidor_4
+
+            x1, y1, x2, y2, conf = box
+            x1, y1 = int(x1 * iw), int(y1 * ih)
+            x2, y2 = int(x2 * iw), int(y2 * ih)
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            roi = frame[y1:y2, x1:x2].copy()
+            if roi.size == 0:
+                continue
+
+            # Aplicar el submodelo especial para Medidor_4
+            submodel = MEDIDOR_TO_MODEL.get('Medidor_4')
+            if not submodel:
+                continue
+
+            sub_results = submodel(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+            dets = []
+            for d in sub_results.xyxy[0]:
+                xa1, ya1, xa2, yb2, conf_sub, cls_sub = d
+                if conf_sub >= CONFIDENCE_THRESHOLD:
+                    cls_name = submodel.names[int(cls_sub)]
+                    # Convertir clase 11 a '6'
+                    cls_name = '6' if cls_name == '11' else cls_name
+                    dets.append({
+                        'class': cls_name,
+                        'box': [int(xa1), int(ya1), int(xa2), int(yb2)],
+                        'confidence': float(conf_sub)
+                    })
+            dets = nms(dets, iou_thres=IOU_THRESHOLD)
+            dets_sorted = sorted(dets, key=lambda dd: dd['box'][0])
+            new_digits = ''.join(dd['class'] for dd in dets_sorted)
+
+            # Ignorar si aparece "10" en Medidor_4
+            if '10' in new_digits:
+                continue  # Ignorar detección
+            else:
+                # Validar y confirmar
+                if is_any_valid('Medidor_4', new_digits):
+                    DETECTION_BUFFER['Medidor_4'].append(new_digits)
+                    if len(DETECTION_BUFFER['Medidor_4']) > MAX_BUFFER_SIZE:
+                        DETECTION_BUFFER['Medidor_4'].pop(0)
+
+                    confirmed_value = check_consensus(
+                        DETECTION_BUFFER['Medidor_4'],
+                        required_count=CONSENSUS_COUNT
+                    )
+                    if confirmed_value:
+                        HISTORY['Medidor_4'].append(confirmed_value)
+                        print(f"[CONSOLE] Medidor_4 => {confirmed_value}")
+                        DETECTION_BUFFER['Medidor_4'].clear()
+
+            # Dibujar ROI y etiqueta
+            cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (0,255,0), 2)
+            cv2.putText(roi, 'Medidor_4', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+            rois.append(roi)
+
+            # Guardar la ROI para excluirla en Display.pt
+            medidor_4_rois.append([x1, y1, x2, y2])
+
+    # Paso 3: Detectar Medidor_1, Medidor_2, Medidor_3 usando Display.pt
+    results_display = display_model(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    labels_display = results_display.xyxyn[0][:, -1].cpu().numpy()
+    boxes_display  = results_display.xyxyn[0][:, :-1].cpu().numpy()
+
+    for label, box in zip(labels_display, boxes_display):
+        class_id = int(label)
+        class_name = display_model.names[class_id]
+        if class_name not in ['Medidor_1', 'Medidor_2', 'Medidor_3']:
+            continue  # Solo procesar estos medidores
+
         x1, y1, x2, y2, conf = box
-        if conf < DISPLAY_CONFIDENCE_THRESHOLD:
-            continue  # Descartar si la confianza del display < threshold
-
         x1, y1 = int(x1 * iw), int(y1 * ih)
         x2, y2 = int(x2 * iw), int(y2 * ih)
+
         if x2 <= x1 or y2 <= y1:
             continue
+
+        # Verificar si esta ROI se solapa con alguna de las ROIs de Medidor_4
+        overlap = False
+        for med4_box in medidor_4_rois:
+            iou_val = iou([x1, y1, x2, y2], med4_box)
+            if iou_val > 0.3:  # Ajusta el umbral según sea necesario
+                overlap = True
+                break
+        if overlap:
+            continue  # Excluir esta detección, ya está manejada por Medidor_4
 
         roi = frame[y1:y2, x1:x2].copy()
         if roi.size == 0:
             continue
 
-        if class_name == 'Medidor_4':
-            found_medidor4 = True
-            # Procesar subdígitos con "digits4_model"
-            detect_subdigits_4(roi)
-            # Dibujarlo
-            cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (255,0,0), 2)
-            cv2.putText(roi, class_name, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-            rois_4.append(roi)
-        elif class_name == 'rf4':
-            found_rf4 = True
+        # Aplicar el submodelo correspondiente
+        submodel = MEDIDOR_TO_MODEL.get(class_name)
+        if not submodel:
+            continue
 
-    if found_medidor4 and found_rf4:
-        found_4 = True
-    return rois_4, found_4
+        sub_results = submodel(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+        dets = []
+        for d in sub_results.xyxy[0]:
+            xa1, ya1, xa2, yb2, conf_sub, cls_sub = d
+            if conf_sub >= CONFIDENCE_THRESHOLD:
+                cls_name = submodel.names[int(cls_sub)]
+                dets.append({
+                    'class': cls_name,
+                    'box': [int(xa1), int(ya1), int(xa2), int(yb2)],
+                    'confidence': float(conf_sub)
+                })
+        dets = nms(dets, iou_thres=IOU_THRESHOLD)
+        dets_sorted = sorted(dets, key=lambda dd: dd['box'][0])
+        new_digits = ''.join(dd['class'] for dd in dets_sorted)
 
-def detect_subdigits_4(roi):
-    """
-    Aplica 'digits4_model' (medidor_especial.pt) con clases 0..9, 10 => rechazo, 11 => '6'.
-    """
-    global digits4_model
-    sub_results = digits4_model(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
-    dets = []
-    for d in sub_results.xyxy[0]:
-        x1, y1, x2, y2, conf_sub, cls_sub = d
-        if conf_sub >= SUBMODEL_CONFIDENCE_THRESHOLD:
-            dets.append({
-                'class': digits4_model.names[int(cls_sub)],
-                'box': [int(x1), int(y1), int(x2), int(y2)],
-                'confidence': float(conf_sub)
-            })
-    dets = nms(dets, iou_thres=IOU_THRESHOLD)
-    dets_sorted = sorted(dets, key=lambda dd: dd['box'][0])
-    digit_list = []
-
-    for dd in dets_sorted:
-        cls_name = dd['class']
-        if cls_name == '10':
-            return  # Rechazo total => salimos sin buffer
-        elif cls_name == '11':
-            digit_list.append('6')  # Convertimos a '6'
+        # Ignorar si aparece "10"
+        if '10' in new_digits:
+            continue  # Ignorar detección
         else:
-            digit_list.append(cls_name)
+            # Validar y confirmar
+            if is_any_valid(class_name, new_digits):
+                DETECTION_BUFFER[class_name].append(new_digits)
+                if len(DETECTION_BUFFER[class_name]) > MAX_BUFFER_SIZE:
+                    DETECTION_BUFFER[class_name].pop(0)
 
-    new_digits = ''.join(digit_list)
-    if is_any_valid('Medidor_4', new_digits):
-        DETECTION_BUFFER['Medidor_4'].append(new_digits)
-        if len(DETECTION_BUFFER['Medidor_4']) > MAX_BUFFER_SIZE:
-            DETECTION_BUFFER['Medidor_4'].pop(0)
+                confirmed_value = check_consensus(
+                    DETECTION_BUFFER[class_name],
+                    required_count=CONSENSUS_COUNT
+                )
+                if confirmed_value:
+                    HISTORY[class_name].append(confirmed_value)
+                    print(f"[CONSOLE] {class_name} => {confirmed_value}")
+                    DETECTION_BUFFER[class_name].clear()
 
-        confirmed = check_consensus(
-            DETECTION_BUFFER['Medidor_4'],
-            required_count=CONSENSUS_COUNT
-        )
-        if confirmed is not None:
-            HISTORY['Medidor_4'].append(confirmed)
-            print(f"[CONSOLE] Medidor_4 => {confirmed}")
-            DETECTION_BUFFER['Medidor_4'].clear()
-
-###############################################################################
-#           DETECCIÓN DE MEDIDOR_1,2,3 (DISPLAY.PT)                           #
-###############################################################################
-def detect_display123(frame):
-    """
-    Detecta Medidor_1,2,3 en 'frame' con un threshold de confianza para el display.
-    Aplica submodelos de dígitos (Analogico, ult, metal).
-    """
-    results = display_model(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    labels = results.xyxyn[0][:, -1].cpu().numpy()
-    boxes  = results.xyxyn[0][:, :-1].cpu().numpy()
-
-    ih, iw, _ = frame.shape
-    rois_123 = []
-
-    for label, box in zip(labels, boxes):
-        class_index = int(label)
-        class_name = display_model.names[class_index]
-        x1, y1, x2, y2, conf = box
-        if conf < DISPLAY_CONFIDENCE_THRESHOLD:
-            continue  # No procesar displays con baja confianza
-
-        x1, y1 = int(x1 * iw), int(y1 * ih)
-        x2, y2 = int(x2 * iw), int(y2 * ih)
-        if x2 <= x1 or y2 <= y1:
-            continue
-
-        roi = frame[y1:y2, x1:x2].copy()
-        if roi.size == 0:
-            continue
-
-        submodel = MEDIDOR_TO_MODEL.get(class_name, None)
-        if submodel:
-            detect_subdigits(roi, class_name, submodel)
-
+        # Dibujar ROI y etiqueta
         cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (0,255,0), 2)
         cv2.putText(roi, class_name, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+        rois.append(roi)
 
-        rois_123.append(roi)
+    return rois
 
-    return rois_123
-
-def detect_subdigits(roi, medidor_class_name, submodel):
-    """
-    Aplica submodelo (Analogico, ult, metal). Rechaza '10' y valida el resto.
-    """
-    sub_results = submodel(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
-    dets = []
-    for d in sub_results.xyxy[0]:
-        x1, y1, x2, y2, conf_sub, cls_sub = d
-        if conf_sub >= SUBMODEL_CONFIDENCE_THRESHOLD:
-            dets.append({
-                'class': submodel.names[int(cls_sub)],
-                'box': [int(x1), int(y1), int(x2), int(y2)],
-                'confidence': float(conf_sub)
-            })
-    dets = nms(dets, iou_thres=IOU_THRESHOLD)
-    dets_sorted = sorted(dets, key=lambda dd: dd['box'][0])
-    new_digits = ''.join(dd['class'] for dd in dets_sorted)
-
-    # Rechazo total si aparece '10'
-    if '10' in [dd['class'] for dd in dets_sorted]:
-        return
-
-    # Validación => buffer => consenso => imprimir
-    if is_any_valid(medidor_class_name, new_digits):
-        DETECTION_BUFFER[medidor_class_name].append(new_digits)
-        if len(DETECTION_BUFFER[medidor_class_name]) > MAX_BUFFER_SIZE:
-            DETECTION_BUFFER[medidor_class_name].pop(0)
-        confirmed = check_consensus(
-            DETECTION_BUFFER[medidor_class_name],
-            required_count=CONSENSUS_COUNT
-        )
-        if confirmed is not None:
-            HISTORY[medidor_class_name].append(confirmed)
-            print(f"[CONSOLE] {medidor_class_name} => {confirmed}")
-            DETECTION_BUFFER[medidor_class_name].clear()
-
-###############################################################################
-#                     COMBINAR ROIS EN UNA SOLA IMAGEN                        #
-###############################################################################
-def combine_rois(rois, max_rois_per_row=3, padding=10):
-    """
-    Combina múltiples ROIs en una sola imagen, sin redimensionarlas.
-    """
+def combine_rois(rois, max_rois_per_row=4, padding=10):
+    """Combina múltiples ROIs en una sola imagen sin redimensionarlas."""
     if not rois:
         blank = np.zeros((300, 400, 3), dtype=np.uint8)
-        cv2.putText(blank, 'No detecciones', (50,150),
+        cv2.putText(blank, 'No detecciones', (50,150), 
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
         return blank
 
@@ -458,8 +455,8 @@ def combine_rois(rois, max_rois_per_row=3, padding=10):
     num_cols = min(num_rois, max_rois_per_row)
     num_rows = (num_rois + max_rois_per_row - 1) // max_rois_per_row
 
-    widths = [r.shape[1] for r in rois]
-    heights= [r.shape[0] for r in rois]
+    widths  = [r.shape[1] for r in rois]
+    heights = [r.shape[0] for r in rois]
 
     col_widths = [0]*num_cols
     for i, roi in enumerate(rois):
@@ -491,8 +488,8 @@ def combine_rois(rois, max_rois_per_row=3, padding=10):
 
     return combined
 
-###############################################################################
+# =============================================================================
 # MAIN
-###############################################################################
+# =============================================================================
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, threaded=True)

@@ -1,6 +1,0 @@
-Flask
-Flask-Cors
-numpy
-opencv-python
-torch
-torchvision
