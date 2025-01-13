@@ -6,7 +6,17 @@ from flask import Flask, render_template, Response, jsonify
 import threading
 from flask_cors import CORS
 import warnings
-import os  # Asegúrate de importar os si aún no lo has hecho
+import os
+import struct
+import snap7
+from snap7.util import *
+import queue
+import time
+import atexit
+import sys
+
+# Redirigir stderr a un archivo de log
+sys.stderr = open('snap7_errors.log', 'w')
 
 ###############################################################################
 #                        IGNORAR LOS FUTUREWARNING DE TORCH                   #
@@ -21,7 +31,7 @@ IOU_THRESHOLD = 0.5          # Umbral para NMS
 CONSENSUS_COUNT = 5          # Cantidad de lecturas similares para confirmar detección
 MAX_BUFFER_SIZE = 10         # Tamaño máximo del buffer de lecturas
 
-CAMERA_INDEX = 0           # Índice de la cámara (ajusta según tu sistema)
+CAMERA_INDEX = 0            # Índice de la cámara (ajusta según tu sistema)
 DETECT_ACTIVE = False
 LOCK = threading.Lock()
 
@@ -206,6 +216,67 @@ MEDIDOR_TO_MODEL = {
 }
 
 ###############################################################################
+#                             CONEXIÓN CON EL PLC                              #
+###############################################################################
+# Crear una cola para almacenar los datos a enviar al PLC
+plc_queue = queue.Queue()
+
+# Configuración del PLC
+PLC_IP = '172.16.181.10'
+PLC_RACK = 0
+PLC_SLOT = 2
+
+# Inicializar el cliente snap7
+cliente = snap7.client.Client()
+
+# Variable para controlar la impresión del mensaje de espera
+print_waiting_message = False
+
+def plc_worker():
+    global cliente, print_waiting_message
+    while True:
+        if not cliente.get_connected():
+            try:
+                cliente.connect(PLC_IP, PLC_RACK, PLC_SLOT)
+                if cliente.get_connected():
+                    print(f"Conectado al PLC en {PLC_IP}, rack {PLC_RACK}, slot {PLC_SLOT}")
+                    print_waiting_message = False  # Resetear la bandera
+            except Exception as e:
+                if not print_waiting_message:
+                    print("Esperando conexión con el PLC...")
+                    print_waiting_message = True
+                time.sleep(5)  # Esperar 5 segundos antes de reintentar
+                continue  # Reintentar la conexión
+        
+        try:
+            # Intentar obtener un dato de la cola con timeout
+            dato_final = plc_queue.get(timeout=1)
+            # Empaquetar el dato como un entero de 4 bytes en Big Endian
+            data_word = bytearray(struct.pack('>I', int(dato_final)))
+            db_number = 10
+            start = 8
+            cliente.db_write(db_number, start, data_word)
+            print(f"Escritura en DB {db_number}: {dato_final}")
+        except queue.Empty:
+            continue  # No hay datos para enviar
+        except Exception as e:
+            print(f"Error al escribir en el PLC: {e}")
+            cliente.disconnect()
+            print_waiting_message = True  # Asegurar que el mensaje de espera se imprima
+
+# Iniciar el hilo del PLC
+plc_thread = threading.Thread(target=plc_worker, daemon=True)
+plc_thread.start()
+
+# Asegurar que la conexión al PLC se cierre al finalizar la aplicación
+def close_plc_connection():
+    if cliente.get_connected():
+        cliente.disconnect()
+        print("Desconectado del PLC.")
+
+atexit.register(close_plc_connection)
+
+###############################################################################
 #                             APLICACIÓN FLASK                                #
 ###############################################################################
 app = Flask(__name__)
@@ -274,12 +345,7 @@ def generate_frames():
 ###############################################################################
 def detect_display(frame):
     """
-    1. Detecta todas las instancias de rf4 usando Display_4.pt.
-    2. Detecta Medidor_4 usando Display_4.pt.
-    3. Si al menos un rf4 está presente, procesa las detecciones de Medidor_4.
-    4. Excluye las ROIs de Medidor_4 de las detecciones de Display.pt para evitar confusiones con otros medidores.
-    5. Procesa las detecciones de Medidor_1, Medidor_2 y Medidor_3 usando Display.pt.
-    6. Solo imprime en consola los valores confirmados.
+    Función de detección de medidores y manejo de ROIs.
     """
     rois = []
     ih, iw, _ = frame.shape
@@ -365,9 +431,16 @@ def detect_display(frame):
                         required_count=CONSENSUS_COUNT
                     )
                     if confirmed_value:
-                        HISTORY['Medidor_4'].append(confirmed_value)
-                        print(f"[CONSOLE] Medidor_4 => {confirmed_value}")
+                        dato_final = confirmed_value  # Asignar a dato_final
+                        HISTORY['Medidor_4'].append(dato_final)
+                        print(f"[CONSOLE] Medidor_4 => {dato_final}")
                         DETECTION_BUFFER['Medidor_4'].clear()
+
+                        # Encolar el dato_final para enviarlo al PLC
+                        try:
+                            plc_queue.put_nowait(int(dato_final))
+                        except queue.Full:
+                            print("La cola para el PLC está llena. Se omitirá el dato.")
 
             # Dibujar ROI y etiqueta
             cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (0,255,0), 2)
@@ -447,9 +520,16 @@ def detect_display(frame):
                         required_count=CONSENSUS_COUNT
                     )
                     if confirmed_value:
-                        HISTORY[class_name].append(confirmed_value)
-                        print(f"[CONSOLE] {class_name} => {confirmed_value}")
+                        dato_final = confirmed_value  # Asignar a dato_final
+                        HISTORY[class_name].append(dato_final)
+                        print(f"[CONSOLE] {class_name} => {dato_final}")
                         DETECTION_BUFFER[class_name].clear()
+
+                        # Encolar el dato_final para enviarlo al PLC
+                        try:
+                            plc_queue.put_nowait(int(dato_final))
+                        except queue.Full:
+                            print("La cola para el PLC está llena. Se omitirá el dato.")
 
         # Dibujar ROI y etiqueta
         if '10' in new_digits:
@@ -511,4 +591,8 @@ def combine_rois(rois, max_rois_per_row=4, padding=10):
 # MAIN
 # =============================================================================
 if __name__ == '__main__':
+    # Iniciar el hilo del PLC antes de correr Flask
+    plc_thread = threading.Thread(target=plc_worker, daemon=True)
+    plc_thread.start()
+
     app.run(host='0.0.0.0', port=5000, threaded=True)
