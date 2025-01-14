@@ -28,8 +28,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 ###############################################################################
 CONFIDENCE_THRESHOLD = 0.5   # Umbral de confianza para submodelos
 IOU_THRESHOLD = 0.5          # Umbral para NMS
-CONSENSUS_COUNT = 5          # Cantidad de lecturas similares para confirmar detección
-MAX_BUFFER_SIZE = 10         # Tamaño máximo del buffer de lecturas
+CONSENSUS_COUNT = 0          # Cantidad de lecturas similares para confirmar detección
+MAX_BUFFER_SIZE = 5       # Tamaño máximo del buffer de lecturas
 
 CAMERA_INDEX = 0            # Índice de la cámara (ajusta según tu sistema)
 DETECT_ACTIVE = False
@@ -413,8 +413,8 @@ def detect_display(frame):
             # Manejar detecciones de clase '10'
             if '10' in new_digits:
                 # Dibujar ROI y etiqueta indicando que se detectó '10'
-                cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (0,0,255), 2)  # Rojo para indicar problema
-                cv2.putText(roi, 'Clase 10 detectada', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+                cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (255,0,0), 2)  # Rojo para indicar problema
+                #cv2.putText(roi, 'Clase 10 detectada', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
                 rois.append(roi)  # Agregar la ROI sin añadir al buffer ni historial
                 # Guardar la ROI para excluirla en Display.pt
                 medidor_4_rois.append([x1, y1, x2, y2])
@@ -504,8 +504,8 @@ def detect_display(frame):
             # Manejar detecciones de clase '10'
             if '10' in new_digits:
                 # Dibujar ROI y etiqueta indicando que se detectó '10'
-                cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (0,0,255), 2)  # Rojo para indicar problema
-                cv2.putText(roi, 'Clase 10 detectada', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+                cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (255,0,0), 2)  # Rojo para indicar problema
+                #cv2.putText(roi, 'Clase 10 detectada', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
                 rois.append(roi)  # Agregar la ROI sin añadir al buffer ni historial
                 continue  # No agregar al buffer ni al historial
             else:
