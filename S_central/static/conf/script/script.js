@@ -1,184 +1,67 @@
-// Funci贸n para actualizar los valores actuales de las c谩maras
-function updateCurrentValues() {
-    const cameraUrls = [
-        'http://192.168.0.41:5001/get_current_value',
-        'http://192.168.0.42:5001/get_current_value',
-        'http://192.168.0.43:5001/get_current_value',
-        'http://192.168.0.44:5001/get_current_value',
-        'http://192.168.0.45:5001/get_current_value',
-        'http://192.168.0.80:5001/get_current_value'
-    ];
+// Configuraci髇 de dispositivos
+const devices = [
+    { name: 'Camera 1', ip: '192.168.0.42', port: 5000, datoId: 'current_cam1' },
+    { name: 'Camera 2', ip: '192.168.0.42', port: 5000, datoId: 'current_cam2' },
+    { name: 'Camera 3', ip: '192.168.0.43', port: 5000, datoId: 'current_cam3' },
+    { name: 'Camera 4', ip: '192.168.0.44', port: 5000, datoId: 'current_cam4' },
+    { name: 'Camera 5', ip: '192.168.0.45', port: 5000, datoId: 'current_cam5' },
+    { name: 'Camera 6', ip: '192.168.0.80', port: 5000, datoId: 'current_cam6' }
+];
 
-    cameraUrls.forEach((url, index) => {
-        fetch(url)
-            .then(response => {
-                if (!response.ok) {
-                    throw new Error(`No se pudo conectar con la c谩mara ${index + 1}`);
-                }
-                return response.json();
-            })
-            .then(data => {
-                document.getElementById(`current_cam${index + 1}`).innerText = 'Valor: ' + data.current_value;
-            })
-            .catch(error => {
-                console.warn(`La c谩mara ${index + 1} no est谩 disponible. Error de conexi贸n.`);
-                document.getElementById(`current_cam${index + 1}`).innerText = 'Error de conexi贸n';
-            });
+
+
+// Funci髇 para iniciar detecci髇
+function activateDetection() {
+    devices.forEach(device => {
+        fetch(`http://${device.ip}:${device.port}/start`)
+        .then(response => response.json())
+        .then(data => {
+            console.log(`${device.name}: Detecci髇 iniciada`);
+        })
+        .catch(error => {
+            console.error(`${device.name}: Error al iniciar detecci髇`, error);
+        });
     });
 }
 
-setInterval(updateCurrentValues, 1000);  // Actualizar cada segundo
-
-// Funci贸n para actualizar la imagen de las c谩maras
-function actualizarImagenCamara(id, url) {
-    document.getElementById(`img${id}`).alt = 'Esperando actualizaci贸n del servidor...';
-
-    fetch(`${url}/estado`)
+// Funci髇 para detener detecci髇
+function detenerDeteccion() {
+    devices.forEach(device => {
+        fetch(`http://${device.ip}:${device.port}/stop`)
         .then(response => response.json())
         .then(data => {
-            console.log(`Valor del estado de la c谩mara ${id}:`, data.estado);
-            if (data.estado === 0) {
-                fetch(`${url}/read_frame`)
-                    .then(response => {
-                        if (!response.ok) {
-                            throw new Error(`Error al obtener la imagen de la c谩mara ${id}`);
-                        }
-                        return response.blob();
-                    })
-                    .then(blob => {
-                        const imageUrl = URL.createObjectURL(blob);
-                        document.getElementById(`img${id}`).src = imageUrl;
-                        document.getElementById(`img${id}`).alt = `Stream de la c谩mara ${id}`;
-                    })
-                    .catch(error => {
-                        document.getElementById(`img${id}`).alt = 'Error al obtener la imagen';
-                        console.warn('Verifique las conexiones');
-                    });
-            } else {
-                document.getElementById(`img${id}`).alt = 'Esperando, modelo en ejecuci贸n...';
+            console.log(`${device.name}: Detecci髇 detenida`);
+        })
+        .catch(error => {
+            console.error(`${device.name}: Error al detener detecci髇`, error);
+        });
+    });
+}
+
+// Funci髇 para obtener datos de cada dispositivo
+function actualizarDatos() {
+    devices.forEach(device => {
+        fetch(`http://${device.ip}:${device.port}/data`)
+        .then(response => response.json())
+        .then(data => {
+            const datoFinal = data.value; // Aseg鷕ate de que el endpoint devuelve 'value'
+            const elementoDato = document.getElementById(device.datoId);
+            if (elementoDato) {
+                elementoDato.textContent = datoFinal !== null ? datoFinal : 'Esperando Iniciar';
             }
         })
         .catch(error => {
-            document.getElementById(`img${id}`).alt = 'Error al obtener el estado del JSON';
-            console.warn('Verifique las conexiones');
+            console.error(`${device.name}: Error al obtener datos`, error);
+            const elementoDato = document.getElementById(device.datoId);
+            if (elementoDato) {
+                elementoDato.textContent = 'Esperando Iniciar';
+            }
         });
-}
-
-function iniciarActualizacionImagenes() {
-    const cameraUrls = [
-        'http://192.168.0.41:5001',
-        'http://192.168.0.42:5001',
-        'http://192.168.0.43:5001',
-        'http://192.168.0.44:5001',
-        'http://192.168.0.45:5001',
-        'http://192.168.0.80:5001'
-    ];
-
-    cameraUrls.forEach((url, index) => {
-        actualizarImagenCamara(index + 1, url);
-        setInterval(() => actualizarImagenCamara(index + 1, url), 1000);  // Actualizar cada segundo
     });
 }
 
-window.onload = function() {
-    iniciarActualizacionImagenes();
+// Actualizaci髇 peri骴ica de datos
+setInterval(actualizarDatos, 200);
 
-    // Verificar si la detecci贸n ya fue activada
-    if (localStorage.getItem('detectionStarted') === 'true') {
-        document.getElementById('startBtn').disabled = true;
-        document.getElementById('startBtn').classList.add('active');
-    } else {
-        document.getElementById('startBtn').disabled = false;
-        document.getElementById('startBtn').classList.remove('active');
-    }
-};
-
-// Funci贸n para activar la detecci贸n con verificaci贸n del estado
-function activateDetection() {
-    const startButton = document.getElementById("startBtn");
-    document.getElementById("startBtn").removeAttribute("onclick");
-
-    const fanlessUrls = [
-        'http://192.168.0.41:5001',
-        'http://192.168.0.42:5001',
-        'http://192.168.0.43:5001',
-        'http://192.168.0.44:5001',
-        'http://192.168.0.45:5001',
-        'http://192.168.0.80:5001'
-    ];
-
-    let canActivate = true; // Bandera para verificar si podemos activar la detecci贸n
-
-    // Verificamos los estados de todos los fanless
-    Promise.all(
-        fanlessUrls.map((url, index) =>
-            fetch(`${url}/estado`)  // LLAMADA AL M脡TODO ESTADO DE CADA FANLESS
-                .then(response => response.json())
-                .then(data => {
-                    console.log(`Estado de la c谩mara ${index + 1}:`, data.estado);
-                    if (data.estado === 0) { // Si alguno ya est谩 en ejecuci贸n
-                        console.warn(`La c谩mara ${index + 1} ya tiene detecci贸n activa.`);
-                        canActivate = false;
-                    }
-                })
-                .catch(error => console.error(`Error al verificar el estado de la c谩mara ${index + 1}:`, error))
-        )
-    ).then(() => {
-        if (canActivate) {
-            // Si todos los fanless est谩n inactivos, podemos activar la detecci贸n
-            fanlessUrls.forEach((url, index) => {
-                fetch(`${url}/start_detection`, { method: 'GET' })
-                    .then(response => {
-                        if (!response.ok) {
-                            throw new Error(`Fallo al activar la detecci贸n en la c谩mara ${index + 1}`);
-                        }
-                        console.log(`Detecci贸n activada en la c谩mara ${index + 1}`);
-                    })
-                    .catch(error => console.error(`Error activando la detecci贸n en la c谩mara ${index + 1}:`, error));
-            });
-
-            startButton.classList.add("active");
-            localStorage.setItem('detectionStarted', 'true');  // Guardar en localStorage
-        } else {
-            console.warn("Al menos una c谩mara ya est谩 activa. No se puede iniciar la detecci贸n.");
-        }
-    });
-}
-
-// Funci贸n para detener la detecci贸n
-function detenerDeteccion() {
-    const startButton = document.getElementById("startBtn");
-    
-    startButton.classList.remove("active");
-    console.log("Detecci贸n detenida.");
-            
-    const fanlessUrls = [
-        'http://192.168.0.41:5001/stop_detection',
-        'http://192.168.0.42:5001/stop_detection',
-        'http://192.168.0.43:5001/stop_detection',
-        'http://192.168.0.44:5001/stop_detection',
-        'http://192.168.0.45:5001/stop_detection',
-        'http://192.168.0.80:5001/stop_detection'
-    ];
-
-    fanlessUrls.reduce((promiseChain, url, index) => {
-        return promiseChain.then(() => {
-            return fetch(url, { method: 'GET' })
-                .then(response => {
-                    if (!response.ok) {
-                        throw new Error(`Fallo al detener la detecci贸n en la c谩mara ${index + 1}`);
-                    }
-                    document.getElementById(`current_cam${index + 1}`).innerText = 'Valor: 0';
-                    document.getElementById(`img${index + 1}`).alt = 'Detenido';
-                });
-        }).catch(error => console.error(`Error procesando la c谩mara ${index + 1}:`, error));
-    }, Promise.resolve()).then(() => {
-        // Limpia el estado en el localStorage
-        localStorage.setItem('detectionStarted', 'false');
-
-        // Recargar la p谩gina autom谩ticamente una vez que se ha detenido la detecci贸n en todos los fanless
-        setTimeout(() => {
-            location.reload();
-        }, 500);  // Esperar 0.5 segundos antes de recargar la p谩gina (puedes ajustar el tiempo si es necesario)
-    });
-}
+// Actualizar datos al cargar la p醙ina
+document.addEventListener('DOMContentLoaded', actualizarDatos);
