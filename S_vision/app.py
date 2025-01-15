@@ -28,12 +28,14 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 ###############################################################################
 CONFIDENCE_THRESHOLD = 0.5   # Umbral de confianza para submodelos
 IOU_THRESHOLD = 0.5          # Umbral para NMS
-CONSENSUS_COUNT = 0          # Cantidad de lecturas similares para confirmar detección
-MAX_BUFFER_SIZE = 5       # Tamaño máximo del buffer de lecturas
+CONSENSUS_COUNT =  0      # Confirmar detección inmediatamente
+MAX_BUFFER_SIZE = 1          # Tamaño máximo del buffer de lecturas
 
-CAMERA_INDEX = 0            # Índice de la cámara (ajusta según tu sistema)
+CAMERA_INDEX = 0              # Índice de la cámara (ajusta según tu sistema)
 DETECT_ACTIVE = False
 LOCK = threading.Lock()
+
+LAST_CONFIRMED_VALUE = {"medidor": None, "value": 0}  # Inicializar con valor numérico
 
 ###############################################################################
 #                 HISTORIAL Y BUFFERS PARA CADA MEDIDOR                       #
@@ -104,7 +106,7 @@ def nms(detections, iou_thres=0.5):
         ]
     return final
 
-def check_consensus(buffer_list, required_count=5):
+def check_consensus(buffer_list, required_count=1):
     """
     Verifica si en buffer_list hay un consenso >= required_count.
     - Si todas las últimas 'required_count' lecturas son iguales => confirmamos.
@@ -247,10 +249,10 @@ def plc_worker():
                     print_waiting_message = True
                 time.sleep(5)  # Esperar 5 segundos antes de reintentar
                 continue  # Reintentar la conexión
-        
+
         try:
-            # Intentar obtener un dato de la cola con timeout
-            dato_final = plc_queue.get(timeout=1)
+            # Intentar obtener un dato de la cola con timeout reducido
+            dato_final = plc_queue.get(timeout=0.1)
             # Empaquetar el dato como un entero de 4 bytes en Big Endian
             data_word = bytearray(struct.pack('>I', int(dato_final)))
             db_number = 10
@@ -283,6 +285,9 @@ app = Flask(__name__)
 CORS(app)
 
 cap = cv2.VideoCapture(CAMERA_INDEX)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Reducir resolución para mayor velocidad
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_FPS, 30)  # Configurar FPS
 
 @app.route('/')
 def index():
@@ -300,16 +305,29 @@ def start_detection():
     global DETECT_ACTIVE
     with LOCK:
         DETECT_ACTIVE = True
+    print("[DEBUG] Detección iniciada.")
     return jsonify({'status': 'detección iniciada'})
+
+@app.route('/data', methods=['GET'])
+def get_data():
+    """
+    Endpoint para obtener el último valor confirmado.
+    Retorna un JSON con el nombre del medidor y el valor detectado.
+    """
+    global LAST_CONFIRMED_VALUE
+    with LOCK:
+        data = LAST_CONFIRMED_VALUE.copy()
+    return jsonify(data)
 
 @app.route('/stop', methods=['GET'])
 def stop_detection():
     """
-    Al detener la detección, RESETEAMOS los valores:
-    - Se limpia HISTORY y DETECTION_BUFFER
+    Al detener la detección:
+    - Se limpia HISTORY, DETECTION_BUFFER
     - Se pone DETECT_ACTIVE en False
+    - Se reinicia LAST_CONFIRMED_VALUE a valores por defecto
     """
-    global DETECT_ACTIVE
+    global DETECT_ACTIVE, LAST_CONFIRMED_VALUE
     with LOCK:
         DETECT_ACTIVE = False
         # Resetear buffers e historial
@@ -317,6 +335,10 @@ def stop_detection():
             DETECTION_BUFFER[medidor].clear()
         for medidor in HISTORY:
             HISTORY[medidor].clear()
+        # Reiniciar LAST_CONFIRMED_VALUE fuera de los bucles
+        LAST_CONFIRMED_VALUE["medidor"] = None
+        LAST_CONFIRMED_VALUE["value"] = 0  # Asigna a 0 para mantener consistencia numérica
+        print("[DEBUG] Detección detenida. LAST_CONFIRMED_VALUE reiniciado a 0.")
     return jsonify({'status': 'detección detenida y valores reseteados'})
 
 def generate_frames():
@@ -331,11 +353,11 @@ def generate_frames():
         if active:
             rois = detect_display(frame)
             combined = combine_rois(rois)
-            ret, buffer = cv2.imencode('.jpg', combined)
-            frame_bytes = buffer.tobytes()
         else:
-            ret, buffer = cv2.imencode('.jpg', frame)
-            frame_bytes = buffer.tobytes()
+            combined = frame  # Devuelve directamente el frame original
+
+        ret, buffer = cv2.imencode('.jpg', combined)
+        frame_bytes = buffer.tobytes()
 
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
@@ -414,7 +436,6 @@ def detect_display(frame):
             if '10' in new_digits:
                 # Dibujar ROI y etiqueta indicando que se detectó '10'
                 cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (255,0,0), 2)  # Rojo para indicar problema
-                #cv2.putText(roi, 'Clase 10 detectada', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
                 rois.append(roi)  # Agregar la ROI sin añadir al buffer ni historial
                 # Guardar la ROI para excluirla en Display.pt
                 medidor_4_rois.append([x1, y1, x2, y2])
@@ -434,13 +455,19 @@ def detect_display(frame):
                         dato_final = confirmed_value  # Asignar a dato_final
                         HISTORY['Medidor_4'].append(dato_final)
                         print(f"[CONSOLE] Medidor_4 => {dato_final}")
-                        DETECTION_BUFFER['Medidor_4'].clear()
+                        with LOCK:
+                            if DETECT_ACTIVE:
+                                LAST_CONFIRMED_VALUE["medidor"] = 'Medidor_4'
+                                LAST_CONFIRMED_VALUE["value"] = dato_final
+                                DETECTION_BUFFER['Medidor_4'].clear()
 
-                        # Encolar el dato_final para enviarlo al PLC
-                        try:
-                            plc_queue.put_nowait(int(dato_final))
-                        except queue.Full:
-                            print("La cola para el PLC está llena. Se omitirá el dato.")
+                                # Encolar el dato_final para enviarlo al PLC
+                                try:
+                                    plc_queue.put_nowait(int(dato_final))
+                                except queue.Full:
+                                    print("La cola para el PLC está llena. Se omitirá el dato.")
+                            else:
+                                print("[DEBUG] Detección detenida. No se actualiza LAST_CONFIRMED_VALUE.")
 
             # Dibujar ROI y etiqueta
             cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (0,255,0), 2)
@@ -505,7 +532,6 @@ def detect_display(frame):
             if '10' in new_digits:
                 # Dibujar ROI y etiqueta indicando que se detectó '10'
                 cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (255,0,0), 2)  # Rojo para indicar problema
-                #cv2.putText(roi, 'Clase 10 detectada', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
                 rois.append(roi)  # Agregar la ROI sin añadir al buffer ni historial
                 continue  # No agregar al buffer ni al historial
             else:
@@ -523,13 +549,19 @@ def detect_display(frame):
                         dato_final = confirmed_value  # Asignar a dato_final
                         HISTORY[class_name].append(dato_final)
                         print(f"[CONSOLE] {class_name} => {dato_final}")
-                        DETECTION_BUFFER[class_name].clear()
+                        with LOCK:
+                            if DETECT_ACTIVE:
+                                LAST_CONFIRMED_VALUE["medidor"] = class_name
+                                LAST_CONFIRMED_VALUE["value"] = dato_final
+                                DETECTION_BUFFER[class_name].clear()
 
-                        # Encolar el dato_final para enviarlo al PLC
-                        try:
-                            plc_queue.put_nowait(int(dato_final))
-                        except queue.Full:
-                            print("La cola para el PLC está llena. Se omitirá el dato.")
+                                # Encolar el dato_final para enviarlo al PLC
+                                try:
+                                    plc_queue.put_nowait(int(dato_final))
+                                except queue.Full:
+                                    print("La cola para el PLC está llena. Se omitirá el dato.")
+                            else:
+                                print("[DEBUG] Detección detenida. No se actualiza LAST_CONFIRMED_VALUE.")
 
         # Dibujar ROI y etiqueta
         if '10' in new_digits:
