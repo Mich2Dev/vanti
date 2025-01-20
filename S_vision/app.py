@@ -559,8 +559,28 @@ def detect_display(frame):
                     # Si no se detecta '10', proceder normalmente
                     print(f"[CONSOLE] Medidor_2 => {new_digits}")
 
+            # --- NUEVO BLOQUE PARA MEDIDOR_3 ---
+            if class_name == 'Medidor_3':
+                if has_class_10:
+                    # Dibujar ROI y etiqueta indicando que se detectó '10' (o la clase específica)
+                    cv2.rectangle(roi, (0, 0), (roi.shape[1]-1, roi.shape[0]-1), (255, 0, 0), 2)  # Rojo para indicar problema
+                    cv2.putText(roi, 'Clase 10 detectada', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+                    rois.append(roi)  # Agregar la ROI sin añadir al buffer ni historial
+
+                    # Verificar si el último valor confirmado es de Medidor_3
+                    with LOCK:
+                        if LAST_CONFIRMED_VALUE["medidor"] == 'Medidor_3' and LAST_CONFIRMED_VALUE["value"] is not None:
+                            print(f"[CONSOLE] Medidor_3 => {LAST_CONFIRMED_VALUE['value']}")
+                        else:
+                            print("[CONSOLE] Medidor_3 => Esperando detección válida.")
+                    continue  # No agregar al buffer ni al historial
+                else:
+                    # Si no se detecta '10', proceder normalmente
+                    print(f"[CONSOLE] Medidor_3 => {new_digits}")
+            # --- FIN BLOQUE PARA MEDIDOR_3 ---
+
             # Manejar detecciones de clase '10' para otros medidores si es necesario
-            if has_class_10 and class_name != 'Medidor_2':
+            if has_class_10 and class_name not in ['Medidor_2', 'Medidor_3']:
                 # Dibujar ROI y etiqueta indicando que se detectó '10'
                 cv2.rectangle(roi, (0, 0), (roi.shape[1]-1, roi.shape[0]-1), (255, 0, 0), 2)  # Rojo para indicar problema
                 cv2.putText(roi, 'Clase 10 detectada', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
@@ -596,7 +616,7 @@ def detect_display(frame):
                                 print("[DEBUG] Detección detenida. No se actualiza LAST_CONFIRMED_VALUE.")
 
         # Dibujar ROI y etiqueta
-        if has_class_10 and class_name == 'Medidor_2':
+        if has_class_10 and class_name in ['Medidor_2', 'Medidor_3']:
             cv2.putText(roi, 'Clase 10 detectada', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         else:
             cv2.putText(roi, class_name, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
