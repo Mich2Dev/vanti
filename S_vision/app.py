@@ -28,14 +28,14 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 ###############################################################################
 CONFIDENCE_THRESHOLD = 0.5   # Umbral de confianza para submodelos
 IOU_THRESHOLD = 0.5          # Umbral para NMS
-CONSENSUS_COUNT =  0      # Confirmar detección inmediatamente
+CONSENSUS_COUNT =  1          # Confirmar detección inmediatamente
 MAX_BUFFER_SIZE = 1          # Tamaño máximo del buffer de lecturas
 
 CAMERA_INDEX = 0              # Índice de la cámara (ajusta según tu sistema)
 DETECT_ACTIVE = False
 LOCK = threading.Lock()
 
-LAST_CONFIRMED_VALUE = {"medidor": None, "value": 0}  # Inicializar con valor numérico
+LAST_CONFIRMED_VALUE = {"medidor": None, "value": None}  # Inicializar sin valor confirmado
 
 ###############################################################################
 #                 HISTORIAL Y BUFFERS PARA CADA MEDIDOR                       #
@@ -337,8 +337,8 @@ def stop_detection():
             HISTORY[medidor].clear()
         # Reiniciar LAST_CONFIRMED_VALUE fuera de los bucles
         LAST_CONFIRMED_VALUE["medidor"] = None
-        LAST_CONFIRMED_VALUE["value"] = 0  # Asigna a 0 para mantener consistencia numérica
-        print("[DEBUG] Detección detenida. LAST_CONFIRMED_VALUE reiniciado a 0.")
+        LAST_CONFIRMED_VALUE["value"] = None  # Asigna a None para indicar ausencia de valor
+        print("[DEBUG] Detección detenida. LAST_CONFIRMED_VALUE reiniciado a None.")
     return jsonify({'status': 'detección detenida y valores reseteados'})
 
 def generate_frames():
@@ -417,25 +417,30 @@ def detect_display(frame):
 
             sub_results = submodel(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
             dets = []
+            has_class_10 = False  # Flag para detectar si hay clase '10'
+
             for d in sub_results.xyxy[0]:
                 xa1, ya1, xa2, yb2, conf_sub, cls_sub = d
-                if conf_sub >= CONFIDENCE_THRESHOLD:
-                    cls_name = submodel.names[int(cls_sub)]
-                    # Convertir clase 11 a '6'
-                    cls_name = '6' if cls_name == '11' else cls_name
+                cls_name = submodel.names[int(cls_sub)]
+                # Convertir clase 11 a '6'
+                cls_name = '6' if cls_name == '11' else cls_name
+                if cls_name == '10':
+                    has_class_10 = True
+                elif conf_sub >= CONFIDENCE_THRESHOLD:
                     dets.append({
                         'class': cls_name,
                         'box': [int(xa1), int(ya1), int(xa2), int(yb2)],
                         'confidence': float(conf_sub)
                     })
+
             dets = nms(dets, iou_thres=IOU_THRESHOLD)
             dets_sorted = sorted(dets, key=lambda dd: dd['box'][0])
             new_digits = ''.join(dd['class'] for dd in dets_sorted)
 
-            # Manejar detecciones de clase '10'
-            if '10' in new_digits:
+            if has_class_10:
                 # Dibujar ROI y etiqueta indicando que se detectó '10'
                 cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (255,0,0), 2)  # Rojo para indicar problema
+                cv2.putText(roi, 'Clase 10 detectada', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
                 rois.append(roi)  # Agregar la ROI sin añadir al buffer ni historial
                 # Guardar la ROI para excluirla en Display.pt
                 medidor_4_rois.append([x1, y1, x2, y2])
@@ -467,11 +472,11 @@ def detect_display(frame):
                                 except queue.Full:
                                     print("La cola para el PLC está llena. Se omitirá el dato.")
                             else:
-                                print("[DEBUG] Detección detenida. No se actualiza LAST_CONFIRMED_VALUE.")
+                                print("[DEBUG] Detección detenida.")
 
             # Dibujar ROI y etiqueta
-            cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (0,255,0), 2)
             cv2.putText(roi, 'Medidor_4', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+            cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (0,255,0), 2)
             rois.append(roi)
 
             # Guardar la ROI para excluirla en Display.pt
@@ -515,23 +520,50 @@ def detect_display(frame):
             # Detectar dígitos con el submodelo
             sub_results = submodel(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
             dets = []
+            has_class_10 = False  # Flag para detectar si hay clase '10'
+
             for d in sub_results.xyxy[0]:
                 xa1, ya1, xa2, yb2, conf_sub, cls_sub = d
-                if conf_sub >= CONFIDENCE_THRESHOLD:
-                    cls_name = submodel.names[int(cls_sub)]
+                cls_name = submodel.names[int(cls_sub)]
+                if class_name == 'Medidor_4':
+                    # En Medidor_4 ya hemos manejado la clase '10' y la conversión de '11' a '6' arriba
+                    continue
+                if cls_name == '10':
+                    has_class_10 = True
+                elif conf_sub >= CONFIDENCE_THRESHOLD:
                     dets.append({
                         'class': cls_name,
                         'box': [int(xa1), int(ya1), int(xa2), int(yb2)],
                         'confidence': float(conf_sub)
                     })
+
             dets = nms(dets, iou_thres=IOU_THRESHOLD)
             dets_sorted = sorted(dets, key=lambda dd: dd['box'][0])
             new_digits = ''.join(dd['class'] for dd in dets_sorted)
 
-            # Manejar detecciones de clase '10'
-            if '10' in new_digits:
+            if class_name == 'Medidor_2':
+                if has_class_10:
+                    # Dibujar ROI y etiqueta indicando que se detectó '10'
+                    cv2.rectangle(roi, (0, 0), (roi.shape[1]-1, roi.shape[0]-1), (255, 0, 0), 2)  # Rojo para indicar problema
+                    cv2.putText(roi, 'Clase 10 detectada', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+                    rois.append(roi)  # Agregar la ROI sin añadir al buffer ni historial
+
+                    # Verificar si el último valor confirmado es de Medidor_2
+                    with LOCK:
+                        if LAST_CONFIRMED_VALUE["medidor"] == 'Medidor_2' and LAST_CONFIRMED_VALUE["value"] is not None:
+                            print(f"[CONSOLE] Medidor_2 => {LAST_CONFIRMED_VALUE['value']}")
+                        else:
+                            print("[CONSOLE] Medidor_2 => Esperando detección válida.")
+                    continue  # No agregar al buffer ni al historial
+                else:
+                    # Si no se detecta '10', proceder normalmente
+                    print(f"[CONSOLE] Medidor_2 => {new_digits}")
+
+            # Manejar detecciones de clase '10' para otros medidores si es necesario
+            if has_class_10 and class_name != 'Medidor_2':
                 # Dibujar ROI y etiqueta indicando que se detectó '10'
-                cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (255,0,0), 2)  # Rojo para indicar problema
+                cv2.rectangle(roi, (0, 0), (roi.shape[1]-1, roi.shape[0]-1), (255, 0, 0), 2)  # Rojo para indicar problema
+                cv2.putText(roi, 'Clase 10 detectada', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
                 rois.append(roi)  # Agregar la ROI sin añadir al buffer ni historial
                 continue  # No agregar al buffer ni al historial
             else:
@@ -564,11 +596,11 @@ def detect_display(frame):
                                 print("[DEBUG] Detección detenida. No se actualiza LAST_CONFIRMED_VALUE.")
 
         # Dibujar ROI y etiqueta
-        if '10' in new_digits:
-            cv2.putText(roi, 'Clase 10 detectada', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+        if has_class_10 and class_name == 'Medidor_2':
+            cv2.putText(roi, 'Clase 10 detectada', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         else:
-            cv2.putText(roi, class_name, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-        cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (0,255,0), 2)
+            cv2.putText(roi, class_name, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.rectangle(roi, (0, 0), (roi.shape[1]-1, roi.shape[0]-1), (0, 255, 0), 2)
         rois.append(roi)
 
     return rois
