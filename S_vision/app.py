@@ -14,6 +14,17 @@ import queue
 import time
 import atexit
 import sys
+import logging
+
+# Configuración de logging
+logging.basicConfig(
+    level=logging.INFO,  # Cambia a DEBUG para más detalles
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("app.log"),
+        logging.StreamHandler()
+    ]
+)
 
 # Redirigir stderr a un archivo de log
 sys.stderr = open('snap7_errors.log', 'w')
@@ -31,7 +42,7 @@ IOU_THRESHOLD = 0.5          # Umbral para NMS
 CONSENSUS_COUNT =  1          # Confirmar detección inmediatamente
 MAX_BUFFER_SIZE = 1          # Tamaño máximo del buffer de lecturas
 
-CAMERA_INDEX = 0              # Índice de la cámara (ajusta según tu sistema)
+CAMERA_INDEX = 0             # Índice de la cámara (ajusta según tu sistema)
 DETECT_ACTIVE = False
 LOCK = threading.Lock()
 
@@ -224,9 +235,9 @@ MEDIDOR_TO_MODEL = {
 plc_queue = queue.Queue()
 
 # Configuración del PLC
-PLC_IP = '172.16.181.10'
+PLC_IP = '192.168.0.12'
 PLC_RACK = 0
-PLC_SLOT = 2
+PLC_SLOT = 1
 
 # Inicializar el cliente snap7
 cliente = snap7.client.Client()
@@ -254,9 +265,9 @@ def plc_worker():
             # Intentar obtener un dato de la cola con timeout reducido
             dato_final = plc_queue.get(timeout=0.1)
             # Empaquetar el dato como un entero de 4 bytes en Big Endian
-            data_word = bytearray(struct.pack('>I', int(dato_final)))
-            db_number = 10
-            start = 8
+            data_word = bytearray(struct.pack('>I', dato_final))
+            db_number = 1
+            start = 0
             cliente.db_write(db_number, start, data_word)
             print(f"Escritura en DB {db_number}: {dato_final}")
         except queue.Empty:
@@ -457,7 +468,12 @@ def detect_display(frame):
                         required_count=CONSENSUS_COUNT
                     )
                     if confirmed_value:
-                        dato_final = confirmed_value  # Asignar a dato_final
+                        try:
+                            dato_final = int(confirmed_value)  # Convertir a entero
+                        except ValueError:
+                            print(f"[ERROR] Valor no válido para convertir a entero: {confirmed_value}")
+                            continue  # O maneja el error según tus necesidades
+
                         HISTORY['Medidor_4'].append(dato_final)
                         print(f"[CONSOLE] Medidor_4 => {dato_final}")
                         with LOCK:
@@ -468,12 +484,13 @@ def detect_display(frame):
 
                                 # Encolar el dato_final para enviarlo al PLC
                                 try:
-                                    plc_queue.put_nowait(int(dato_final))
+                                    plc_queue.put_nowait(dato_final)  # Ya es entero
+                                    print(f"[DEBUG] Valor encolado para el PLC: {dato_final}")
                                 except queue.Full:
                                     print("La cola para el PLC está llena. Se omitirá el dato.")
                             else:
                                 print("[DEBUG] Detección detenida.")
-
+    
             # Dibujar ROI y etiqueta
             cv2.putText(roi, 'Medidor_4', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
             cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (0,255,0), 2)
@@ -598,7 +615,12 @@ def detect_display(frame):
                         required_count=CONSENSUS_COUNT
                     )
                     if confirmed_value:
-                        dato_final = confirmed_value  # Asignar a dato_final
+                        try:
+                            dato_final = int(confirmed_value)  # Convertir a entero
+                        except ValueError:
+                            print(f"[ERROR] Valor no válido para convertir a entero: {confirmed_value}")
+                            continue  # O maneja el error según tus necesidades
+
                         HISTORY[class_name].append(dato_final)
                         print(f"[CONSOLE] {class_name} => {dato_final}")
                         with LOCK:
@@ -609,7 +631,8 @@ def detect_display(frame):
 
                                 # Encolar el dato_final para enviarlo al PLC
                                 try:
-                                    plc_queue.put_nowait(int(dato_final))
+                                    plc_queue.put_nowait(dato_final)  # Ya es entero
+                                    print(f"[DEBUG] Valor encolado para el PLC: {dato_final}")
                                 except queue.Full:
                                     print("La cola para el PLC está llena. Se omitirá el dato.")
                             else:
@@ -680,3 +703,4 @@ if __name__ == '__main__':
     plc_thread.start()
 
     app.run(host='0.0.0.0', port=5000, threaded=True)
+ 
