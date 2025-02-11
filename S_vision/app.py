@@ -2,7 +2,7 @@ import cv2
 import torch
 import numpy as np
 import statistics
-from flask import Flask, render_template, Response, jsonify
+from flask import Flask, render_template, Response, jsonify, request
 import threading
 from flask_cors import CORS
 import warnings
@@ -45,6 +45,9 @@ DETECT_ACTIVE = False
 LOCK = threading.Lock()
 
 LAST_CONFIRMED_VALUE = {"medidor": None, "value": None}  # Para datos a enviar o mostrar
+
+# Variable global para la posición inicial del punto decimal (por defecto 2)
+initial_dot_pos = 2
 
 ###############################################################################
 #                 HISTORIAL Y BUFFERS PARA CADA MEDIDOR                       #
@@ -471,21 +474,20 @@ def detect_display(frame):
             detected_numbers = [det['class'] for det in filtered_numbers]
             if detected_numbers:
                 numero_detectado = ''.join(detected_numbers)
-                # Se mantiene la lógica para el avance progresivo:
-                # Si el número inicia con '0' se asume que la parte entera es de dos dígitos;
-                # de lo contrario, se asume que es de tres dígitos.
+                # Usar la variable global initial_dot_pos para definir la posición del punto.
+                # Si el número detectado inicia con '0' se usa initial_dot_pos, de lo contrario se suma 1.
                 if numero_detectado:
                     if numero_detectado[0] == '0':
-                        pos = 2
+                        pos = initial_dot_pos
                     else:
-                        pos = 3
+                        pos = initial_dot_pos + 1
                     if len(numero_detectado) >= pos:
                         numero_formateado = numero_detectado[:pos] + '.' + numero_detectado[pos:]
                     else:
                         numero_formateado = numero_detectado + '.'
-                    # Creamos la variable que indica después de qué dígito se inserta el punto decimal.
-                    punto_posicion = pos
-                    #print(f"[DEBUG] El punto decimal se inserto despues de la posicion: {punto_posicion}")
+                    print(f"[DEBUG] El punto decimal se insertó después del dígito: {pos}")
+                    # Mostrar en consola el número detectado con el punto decimal
+                    print(f"[DEBUG] Número detectado (con punto): {numero_formateado}")
                 else:
                     numero_formateado = numero_detectado
 
@@ -495,6 +497,8 @@ def detect_display(frame):
                 except ValueError:
                     print(f"[ERROR] Valor no válido en honeywell: {numero_formateado}")
                     dato_final = 0
+                # Mostrar en consola ambos valores: con punto y el entero
+                print(f"[DEBUG] Número detectado: {numero_formateado} (String), {dato_final} (Entero)")
                 with LOCK:
                     LAST_CONFIRMED_VALUE["medidor"] = 'honeywell'
                     LAST_CONFIRMED_VALUE["value"] = dato_final
@@ -572,6 +576,19 @@ def generate_frames():
         frame_bytes = buffer.tobytes()
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+# Ruta para actualizar la posición inicial del punto decimal usando parámetros en la URL.
+@app.route('/set_dot_position', methods=['GET'])
+def set_dot_position():
+    global initial_dot_pos
+    pos = request.args.get("position")
+    if pos is None:
+        return jsonify({"error": "No se recibió el parámetro 'position'"}), 400
+    try:
+        initial_dot_pos = int(pos)
+        return jsonify({"status": "posición actualizada", "position": initial_dot_pos})
+    except ValueError:
+        return jsonify({"error": "El valor de 'position' debe ser un entero"}), 400
 
 @app.route('/start', methods=['GET'])
 def start_detection():

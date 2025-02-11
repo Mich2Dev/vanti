@@ -1,67 +1,83 @@
-// Configuraci髇 de dispositivos
+// Configuraci贸n de dispositivos
 const devices = [
-    { name: 'Camera 1', ip: '192.168.0.42', port: 5000, datoId: 'current_cam1' },
-    { name: 'Camera 2', ip: '192.168.0.42', port: 5000, datoId: 'current_cam2' },
+    { name: 'Camera 1', ip: '127.0.0.1', port: 5000, datoId: 'current_cam1' },
+    { name: 'Camera 2', ip: '127.0.0.1', port: 5000, datoId: 'current_cam2' },
     { name: 'Camera 3', ip: '192.168.0.43', port: 5000, datoId: 'current_cam3' },
     { name: 'Camera 4', ip: '192.168.0.44', port: 5000, datoId: 'current_cam4' },
     { name: 'Camera 5', ip: '192.168.0.45', port: 5000, datoId: 'current_cam5' },
     { name: 'Camera 6', ip: '192.168.0.80', port: 5000, datoId: 'current_cam6' }
 ];
 
-
-
-// Funci髇 para iniciar detecci髇
+// Funci贸n para iniciar detecci贸n
 function activateDetection() {
     devices.forEach(device => {
         fetch(`http://${device.ip}:${device.port}/start`)
-        .then(response => response.json())
-        .then(data => {
-            console.log(`${device.name}: Detecci髇 iniciada`);
-        })
-        .catch(error => {
-            console.error(`${device.name}: Error al iniciar detecci髇`, error);
-        });
+            .then(response => response.json())
+            .then(data => {
+                console.log(`${device.name}: Detecci贸n iniciada`);
+            })
+            .catch(error => {
+                console.error(`${device.name}: Error al iniciar detecci贸n`, error);
+            });
     });
 }
 
-// Funci髇 para detener detecci髇
+// Funci贸n para detener detecci贸n
 function detenerDeteccion() {
     devices.forEach(device => {
         fetch(`http://${device.ip}:${device.port}/stop`)
-        .then(response => response.json())
-        .then(data => {
-            console.log(`${device.name}: Detecci髇 detenida`);
-        })
-        .catch(error => {
-            console.error(`${device.name}: Error al detener detecci髇`, error);
-        });
+            .then(response => response.json())
+            .then(data => {
+                console.log(`${device.name}: Detecci贸n detenida`);
+            })
+            .catch(error => {
+                console.error(`${device.name}: Error al detener detecci贸n`, error);
+            });
     });
 }
 
-// Funci髇 para obtener datos de cada dispositivo
+// Funci贸n para obtener datos de cada dispositivo
 function actualizarDatos() {
     devices.forEach(device => {
         fetch(`http://${device.ip}:${device.port}/data`)
-        .then(response => response.json())
-        .then(data => {
-            const datoFinal = data.value; // Aseg鷕ate de que el endpoint devuelve 'value'
-            const elementoDato = document.getElementById(device.datoId);
-            if (elementoDato) {
-                elementoDato.textContent = datoFinal !== null ? datoFinal : 'Esperando Iniciar';
-            }
-        })
-        .catch(error => {
-            console.error(`${device.name}: Error al obtener datos`, error);
-            const elementoDato = document.getElementById(device.datoId);
-            if (elementoDato) {
-                elementoDato.textContent = 'Esperando Iniciar';
-            }
-        });
+            .then(response => response.json())
+            .then(data => {
+                const datoFinal = data.value; // Se espera que el endpoint devuelva 'value'
+                const elementoDato = document.getElementById(device.datoId);
+                if (elementoDato) {
+                    elementoDato.textContent = datoFinal !== null ? datoFinal : 'Esperando Iniciar';
+                }
+            })
+            .catch(error => {
+                console.error(`${device.name}: Error al obtener datos`, error);
+                const elementoDato = document.getElementById(device.datoId);
+                if (elementoDato) {
+                    elementoDato.textContent = 'Esperando Iniciar';
+                }
+            });
     });
 }
 
-// Actualizaci髇 peri骴ica de datos
+// Funci贸n para actualizar la posici贸n del punto decimal en cada dispositivo
+function updateDotPosition(ip, port, inputId) {
+    const pos = document.getElementById(inputId).value;
+    if (!pos) {
+        alert("Ingrese una posici贸n v谩lida");
+        return;
+    }
+    fetch(`http://${ip}:${port}/set_dot_position?position=${pos}`)
+        .then(response => response.json())
+        .then(data => {
+            console.log(`Posici贸n actualizada en ${ip}:${port} a ${data.position}`);
+        })
+        .catch(error => {
+            console.error(`Error al actualizar la posici贸n en ${ip}:${port}`, error);
+        });
+}
+
+// Actualizaci贸n peri贸dica de datos
 setInterval(actualizarDatos, 200);
 
-// Actualizar datos al cargar la p醙ina
+// Actualizar datos al cargar la p谩gina
 document.addEventListener('DOMContentLoaded', actualizarDatos);
+
