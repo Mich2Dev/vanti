@@ -25,8 +25,6 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-
-# Redirigir stderr a un archivo de log
 sys.stderr = open('snap7_errors.log', 'w')
 
 ###############################################################################
@@ -38,52 +36,42 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 #                           CONFIGURACIÓN GENERAL                             #
 ###############################################################################
 CONFIDENCE_THRESHOLD = 0.5   # Umbral de confianza para submodelos
-IOU_THRESHOLD = 0.3          # Umbral para NMS
-CONSENSUS_COUNT =  1          # Confirmar detección inmediatamente
-MAX_BUFFER_SIZE = 1        # Tamaño máximo del buffer de lecturas
+IOU_THRESHOLD = 0.5          # Umbral para NMS
+CONSENSUS_COUNT = 1          # Confirmar detección inmediatamente
+MAX_BUFFER_SIZE = 1          # Tamaño máximo del buffer de lecturas
 
-CAMERA_INDEX = 2            # Índice de la cámara (ajusta según tu sistema)
+CAMERA_INDEX = 0             # Índice de la cámara (ajusta según tu sistema)
 DETECT_ACTIVE = False
 LOCK = threading.Lock()
 
-LAST_CONFIRMED_VALUE = {"medidor": None, "value": None}  # Inicializar sin valor confirmado
+LAST_CONFIRMED_VALUE = {"medidor": None, "value": None}  # Para datos a enviar o mostrar
 
 ###############################################################################
 #                 HISTORIAL Y BUFFERS PARA CADA MEDIDOR                       #
 ###############################################################################
-# Almacenamos todas las lecturas confirmadas
 HISTORY = {
     'Medidor_1': [], 
     'Medidor_2': [],
     'Medidor_3': [],
-    'Medidor_4': []
+    'Medidor_4': [],
+    'honeywell': []
 }
-
-# Buffer temporal donde se guardan lecturas hasta que se cumpla el consenso
 DETECTION_BUFFER = {
     'Medidor_1': [],
     'Medidor_2': [],
     'Medidor_3': [],
-    'Medidor_4': []
+    'Medidor_4': [],
+    'honeywell': []
 }
 
 ###############################################################################
 #                            FUNCIONES AUXILIARES                             #
 ###############################################################################
 def load_local_model(pt_file: str):
-    """
-    Carga un modelo YOLOv5 local (sin conexión a internet) desde una ruta específica
-    usando torch.hub.load con source='local'.
-    """
+    """Carga un modelo YOLOv5 local usando torch.hub.load."""
     if not os.path.exists(pt_file):
         raise FileNotFoundError(f"El modelo no se encontró en la ruta: {pt_file}")
-    return torch.hub.load(
-        './yolov5',  # Asegúrate de que la ruta a yolov5 sea correcta
-        'custom',
-        path=pt_file,
-        source='local',
-        force_reload=False
-    )
+    return torch.hub.load('./yolov5', 'custom', path=pt_file, source='local', force_reload=False)
 
 def iou(boxA, boxB):
     """Cálculo simple de Intersection Over Union (IOU)."""
@@ -91,15 +79,12 @@ def iou(boxA, boxB):
     yA = max(boxA[1], boxB[1])
     xB = min(boxA[2], boxB[2])
     yB = min(boxA[3], boxB[3])
-
     inter_w = max(0, xB - xA)
     inter_h = max(0, yB - yA)
     inter_area = inter_w * inter_h
-
     areaA = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
     areaB = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
     union_area = areaA + areaB - inter_area
-
     return 0.0 if union_area == 0 else inter_area / union_area
 
 def nms(detections, iou_thres=0.5):
@@ -111,138 +96,98 @@ def nms(detections, iou_thres=0.5):
     while detections:
         best = detections.pop(0)
         final.append(best)
-        detections = [
-            d for d in detections 
-            if iou(best['box'], d['box']) < iou_thres
-        ]
+        detections = [d for d in detections if iou(best['box'], d['box']) < iou_thres]
     return final
 
 def check_consensus(buffer_list, required_count=1):
-    """
-    Verifica si en buffer_list hay un consenso >= required_count.
-    - Si todas las últimas 'required_count' lecturas son iguales => confirmamos.
-    """
+    """Confirma si las últimas 'required_count' lecturas son idénticas."""
     if len(buffer_list) < required_count:
         return None
-
-    # Tomar solo las últimas 'required_count'
     last_values = buffer_list[-required_count:]
-
-    # Verificar si todas son idénticas
     if all(v == last_values[0] for v in last_values):
-        return last_values[-1]  # la última detección se confirma
-
+        return last_values[-1]
     return None
 
 ###############################################################################
-#             FUNCIONES DE VALIDACIÓN (SE ACEPTA SI ALGUNA ES TRUE)           #
+#          FUNCIONES DE VALIDACIÓN (PROGRESIVA Y ADAPTATIVA)                  #
 ###############################################################################
 def is_progressive_valid(medidor, new_str):
-    """
-    Validación 1: Chequeo progresivo (evita saltos muy grandes).
-    - Si no hay detecciones confirmadas, se acepta provisionalmente.
-    - Si hay una anterior, permite un salto de ±2 (puedes ajustar).
-    """
-    if not HISTORY[medidor]: 
-        return True  # Nada previo => no tenemos con qué comparar
-
+    if not HISTORY[medidor]:
+        return True
     try:
         old_val = int(HISTORY[medidor][-1])
         new_val = int(new_str)
     except ValueError:
         return False
-
-    # Aquí permitimos ±5, ajusta si deseas más rango
-    return abs(new_val - old_val) <= 5
+    return abs(new_val - old_val) <= 2
 
 def is_adaptive_range_valid(medidor, new_str, window=10, k=3):
-    """
-    Validación 2: Rango adaptativo basado en estadísticas del historial.
-    - Toma las últimas 'window' lecturas confirmadas
-    - Calcula media y desviación estándar
-    - Permite new_val dentro de (media ± k*desviación).
-    """
     if not HISTORY[medidor]:
-        return True  # Si no hay historial, no hay rango => lo aceptamos
-
+        return True
     try:
         new_val = int(new_str)
     except ValueError:
         return False
-
-    # Tomar las últimas 'window' lecturas
     recent = HISTORY[medidor][-window:]
     if not recent:
         return True
-
     vals_int = []
     for v in recent:
         try:
             vals_int.append(int(v))
         except ValueError:
             pass
-
     if not vals_int:
         return True
-
     media = statistics.mean(vals_int)
-    stdev = statistics.pstdev(vals_int)  # o stdev
+    stdev = statistics.pstdev(vals_int)
     if stdev == 0:
-        # Si todas eran iguales, stdev=0 => permitir algo de rango
         stdev = 1
-
     rango_min = media - k * stdev
     rango_max = media + k * stdev
-
     return (rango_min <= new_val <= rango_max)
 
 def is_any_valid(medidor, new_str):
-    """
-    Se acepta si CUALQUIERA de las validaciones (progresiva o rango adaptativo) es True.
-    """
-    return is_progressive_valid(medidor, new_str) or \
-           is_adaptive_range_valid(medidor, new_str, window=10, k=3)
+    return is_progressive_valid(medidor, new_str) or is_adaptive_range_valid(medidor, new_str, window=10, k=3)
 
 ###############################################################################
 #                               CARGA DE MODELOS                               #
 ###############################################################################
-# Definir rutas de las carpetas
 DISPLAY_MODELS_DIR = 'modelos_display'
 NUMERIC_MODELS_DIR = 'modelos_numericos'
 
-# Cargar modelos principales desde 'modelos_display'
+# Modelos principales
 display_model = load_local_model(os.path.join(DISPLAY_MODELS_DIR, 'Display.pt'))
 display_4_model = load_local_model(os.path.join(DISPLAY_MODELS_DIR, 'Display_4.pt'))
+display_honeywell_model = load_local_model(os.path.join(DISPLAY_MODELS_DIR, 'display_honeywell.pt'))
 
-# Cargar submodelos desde 'modelos_numericos'
+# Submodelos numéricos
 analogico_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'Analogico.pt'))
-negro_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'ult.pt'))  # Asegúrate de que el nombre es correcto
+negro_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'ult.pt'))
 metal_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'metal.pt'))
-medidor_especial_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'medidor_especial.pt'))  # Submodelo para Medidor_4
+medidor_especial_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'medidor_especial.pt'))
+numero_honeywell_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'numero_honeywell.pt'))
 
-# Asociar modelos con medidores
+# Submodelo para Honeywell
+subdisplay_honeywell_model = load_local_model(os.path.join(DISPLAY_MODELS_DIR, 'subdisplay_honeywell.pt'))
+
+# Asociar modelos con cada tipo
 MEDIDOR_TO_MODEL = {
     'Medidor_1': analogico_model,
     'Medidor_2': negro_model,
     'Medidor_3': metal_model,
-    'Medidor_4': medidor_especial_model  # Asociamos Medidor_4 con su submodelo especial
+    'Medidor_4': medidor_especial_model,
+    'honeywell': subdisplay_honeywell_model
 }
 
 ###############################################################################
 #                             CONEXIÓN CON EL PLC                              #
 ###############################################################################
-# Crear una cola para almacenar los datos a enviar al PLC
 plc_queue = queue.Queue()
-
-# Configuración del PLC
-PLC_IP = '192.168.1.11'
+PLC_IP = '192.168.0.12'
 PLC_RACK = 0
 PLC_SLOT = 1
-
-# Inicializar el cliente snap7
 cliente = snap7.client.Client()
-
-# Variable para controlar la impresión del mensaje de espera
 print_waiting_message = False
 
 def plc_worker():
@@ -253,35 +198,30 @@ def plc_worker():
                 cliente.connect(PLC_IP, PLC_RACK, PLC_SLOT)
                 if cliente.get_connected():
                     print(f"Conectado al PLC en {PLC_IP}, rack {PLC_RACK}, slot {PLC_SLOT}")
-                    print_waiting_message = False  # Resetear la bandera
+                    print_waiting_message = False
             except Exception as e:
                 if not print_waiting_message:
                     print("Esperando conexión con el PLC...")
                     print_waiting_message = True
-                time.sleep(5)  # Esperar 5 segundos antes de reintentar
-                continue  # Reintentar la conexión
-
+                time.sleep(5)
+                continue
         try:
-            # Intentar obtener un dato de la cola con timeout reducido
-            dato_final = plc_queue.get(timeout=0.0)
-            # Empaquetar el dato como un entero de 4 bytes en Big Endian
+            dato_final = plc_queue.get(timeout=0.1)
             data_word = bytearray(struct.pack('>I', dato_final))
-            db_number = 6
+            db_number = 1
             start = 0
             cliente.db_write(db_number, start, data_word)
             print(f"Escritura en DB {db_number}: {dato_final}")
         except queue.Empty:
-            continue  # No hay datos para enviar
+            continue
         except Exception as e:
             print(f"Error al escribir en el PLC: {e}")
             cliente.disconnect()
-            print_waiting_message = True  # Asegurar que el mensaje de espera se imprima
+            print_waiting_message = True
 
-# Iniciar el hilo del PLC
 plc_thread = threading.Thread(target=plc_worker, daemon=True)
 plc_thread.start()
 
-# Asegurar que la conexión al PLC se cierre al finalizar la aplicación
 def close_plc_connection():
     if cliente.get_connected():
         cliente.disconnect()
@@ -296,20 +236,18 @@ app = Flask(__name__)
 CORS(app)
 
 ###############################################################################
-#                           HILO DE CAPTURA DE FRAMES                         #
+#                        HILO DE CAPTURA DE FRAMES                          #
 ###############################################################################
 class FrameCaptureThread(threading.Thread):
     def __init__(self, camera_index=CAMERA_INDEX):
         super().__init__(daemon=True)
-        self.camera_index = camera_index
-        self.cap = cv2.VideoCapture(self.camera_index)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Reducir resolución para mayor velocidad
+        self.cap = cv2.VideoCapture(camera_index)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)  # Configurar FPS
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
         self.frame = None
         self.running = True
         self.lock = threading.Lock()
-
     def run(self):
         while self.running:
             success, frame = self.cap.read()
@@ -318,22 +256,17 @@ class FrameCaptureThread(threading.Thread):
                 continue
             with self.lock:
                 self.frame = frame
-            # Pequeña pausa para liberar CPU
             time.sleep(0.01)
-
     def get_frame(self):
         with self.lock:
             return self.frame.copy() if self.frame is not None else None
-
     def stop(self):
         self.running = False
         self.cap.release()
 
-# Iniciar el hilo de captura de frames
 frame_capture_thread = FrameCaptureThread()
 frame_capture_thread.start()
 
-# Asegurar que el hilo de captura se detenga al finalizar
 def stop_frame_capture():
     frame_capture_thread.stop()
     print("Hilo de captura de frames detenido.")
@@ -341,317 +274,269 @@ def stop_frame_capture():
 atexit.register(stop_frame_capture)
 
 ###############################################################################
-#                          CLASE PARA DETECCIÓN POR MEDIDOR                   #
+#                    HILO DE DETECCIÓN CONTINUA (MULTI-HILO)                 #
 ###############################################################################
-class DetectionThread(threading.Thread):
-    def __init__(self, medidor_name, submodel):
+class DetectionLoopThread(threading.Thread):
+    """
+    Este hilo toma los frames capturados y, si DETECT_ACTIVE es True,
+    ejecuta la detección y actualiza el último frame procesado.
+    """
+    def __init__(self):
         super().__init__(daemon=True)
-        self.medidor_name = medidor_name
-        self.submodel = submodel
-        self.queue = queue.Queue()
-        self.processed_rois = queue.Queue()
-
+        self.running = True
+        self.latest_processed_frame = None
     def run(self):
-        while True:
-            try:
-                frame, roi, box = self.queue.get()
-                if frame is None:
-                    break  # Señal para terminar el hilo
-                self.process_roi(frame, roi, box)
-            except Exception as e:
-                logging.error(f"Error en hilo {self.medidor_name}: {e}")
-
-    def process_roi(self, frame, roi, box):
-        global LAST_CONFIRMED_VALUE
-        ih, iw, _ = frame.shape
-        sub_results = self.submodel(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
-        dets = []
-        has_class_10 = False  # Flag para detectar si hay clase '10'
-
-        for d in sub_results.xyxy[0]:
-            xa1, ya1, xa2, yb2, conf_sub, cls_sub = d
-            cls_name = self.submodel.names[int(cls_sub)]
-            # Convertir clase '11' a '6' si es Medidor_4
-            if self.medidor_name == 'Medidor_4' and cls_name == '11':
-                cls_name = '6'
-            if cls_name == '10':
-                has_class_10 = True
-            elif conf_sub >= CONFIDENCE_THRESHOLD:
-                dets.append({
-                    'class': cls_name,
-                    'box': [int(xa1), int(ya1), int(xa2), int(yb2)],
-                    'confidence': float(conf_sub)
-                })
-
-        dets = nms(dets, iou_thres=IOU_THRESHOLD)
-        dets_sorted = sorted(dets, key=lambda dd: dd['box'][0])
-        new_digits = ''.join(dd['class'] for dd in dets_sorted)
-
-        if has_class_10:
-            # Dibujar ROI y etiqueta indicando que se detectó '10'
-            cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (255,0,0), 2)  # Rojo para indicar problema
-            cv2.putText(roi, 'Clase 10 detectada', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
-            self.processed_rois.put(roi)
-            return  # No agregar al buffer ni al historial
-        else:
-            # Validar y confirmar
-            if is_any_valid(self.medidor_name, new_digits):
-                with LOCK:
-                    DETECTION_BUFFER[self.medidor_name].append(new_digits)
-                    if len(DETECTION_BUFFER[self.medidor_name]) > MAX_BUFFER_SIZE:
-                        DETECTION_BUFFER[self.medidor_name].pop(0)
-
-                confirmed_value = check_consensus(
-                    DETECTION_BUFFER[self.medidor_name],
-                    required_count=CONSENSUS_COUNT
-                )
-                if confirmed_value:
-                    try:
-                        dato_final = int(confirmed_value)  # Convertir a entero
-                    except ValueError:
-                        logging.error(f"Valor no válido para convertir a entero: {confirmed_value}")
-                        return  # O maneja el error según tus necesidades
-
-                    with LOCK:
-                        HISTORY[self.medidor_name].append(dato_final)
-                        print(f"[CONSOLE] {self.medidor_name} => {dato_final}")
-                        if DETECT_ACTIVE:
-                            LAST_CONFIRMED_VALUE["medidor"] = self.medidor_name
-                            LAST_CONFIRMED_VALUE["value"] = dato_final
-                            DETECTION_BUFFER[self.medidor_name].clear()
-
-                            # Encolar el dato_final para enviarlo al PLC
-                            try:
-                                plc_queue.put_nowait(dato_final)  # Ya es entero
-                                print(f"[DEBUG] Valor encolado para el PLC: {dato_final}")
-                            except queue.Full:
-                                print("La cola para el PLC está llena. Se omitirá el dato.")
-                        else:
-                            print("[DEBUG] Detección detenida.")
-
-        # Dibujar ROI y etiqueta
-        cv2.putText(roi, self.medidor_name, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-        cv2.rectangle(roi, (0,0), (roi.shape[1]-1, roi.shape[0]-1), (0,255,0), 2)
-        self.processed_rois.put(roi)
-
-# Crear y arrancar hilos de detección para cada medidor
-detection_threads = {}
-for medidor, model in MEDIDOR_TO_MODEL.items():
-    thread = DetectionThread(medidor, model)
-    thread.start()
-    detection_threads[medidor] = thread
-
-###############################################################################
-#                             APLICACIÓN FLASK                                #
-###############################################################################
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-@app.route('/video_feed')
-def video_feed():
-    return Response(
-        generate_frames(),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
-    )
-
-@app.route('/start', methods=['GET'])
-def start_detection():
-    global DETECT_ACTIVE
-    with LOCK:
-        DETECT_ACTIVE = True
-    print("[DEBUG] Detección iniciada.")
-    return jsonify({'status': 'detección iniciada'})
-
-@app.route('/data', methods=['GET'])
-def get_data():
-    """
-    Endpoint para obtener el último valor confirmado.
-    Retorna un JSON con el nombre del medidor y el valor detectado.
-    """
-    global LAST_CONFIRMED_VALUE
-    with LOCK:
-        data = LAST_CONFIRMED_VALUE.copy()
-    return jsonify(data)
-
-@app.route('/stop', methods=['GET'])
-def stop_detection():
-    """
-    Al detener la detección:
-    - Se limpia HISTORY, DETECTION_BUFFER
-    - Se pone DETECT_ACTIVE en False
-    - Se reinicia LAST_CONFIRMED_VALUE a valores por defecto
-    """
-    global DETECT_ACTIVE, LAST_CONFIRMED_VALUE
-    with LOCK:
-        DETECT_ACTIVE = False
-        # Resetear buffers e historial
-        for medidor in DETECTION_BUFFER:
-            DETECTION_BUFFER[medidor].clear()
-        for medidor in HISTORY:
-            HISTORY[medidor].clear()
-        # Reiniciar LAST_CONFIRMED_VALUE fuera de los bucles
-        LAST_CONFIRMED_VALUE["medidor"] = None
-        LAST_CONFIRMED_VALUE["value"] = None  # Asigna a None para indicar ausencia de valor
-        print("[DEBUG] Detección detenida. LAST_CONFIRMED_VALUE reiniciado a None.")
-    return jsonify({'status': 'detección detenida y valores reseteados'})
-
-###############################################################################
-#                           GENERACIÓN DE FRAMES                               #
-###############################################################################
-def generate_frames():
-    global DETECT_ACTIVE
-    while True:
-        frame = frame_capture_thread.get_frame()
-        if frame is None:
-            # No hay frame disponible, esperar un poco
+        global DETECT_ACTIVE
+        while self.running:
+            frame = frame_capture_thread.get_frame()
+            if frame is None:
+                time.sleep(0.01)
+                continue
+            if DETECT_ACTIVE:
+                processed = detect_display(frame)
+                combined = combine_rois(processed)
+                self.latest_processed_frame = combined
+            else:
+                self.latest_processed_frame = frame
             time.sleep(0.01)
-            continue
+    def get_processed_frame(self):
+        if self.latest_processed_frame is not None:
+            return self.latest_processed_frame.copy()
+        return None
+    def stop(self):
+        self.running = False
 
-        with LOCK:
-            active = DETECT_ACTIVE
-
-        if active:
-            rois = detect_display(frame)
-            combined = combine_rois(rois)
-        else:
-            combined = frame  # Devuelve directamente el frame original
-
-        ret, buffer = cv2.imencode('.jpg', combined)
-        frame_bytes = buffer.tobytes()
-
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+detection_loop_thread = DetectionLoopThread()
+detection_loop_thread.start()
 
 ###############################################################################
-#                           FUNCIÓN PRINCIPAL DE DETECCIÓN                    #
+#              FUNCIÓN DE DETECCIÓN: PROCESAR TODAS LAS RAMAS                #
 ###############################################################################
 def detect_display(frame):
     """
-    Función de detección de medidores y manejo de ROIs.
+    Esta función procesa dos ramas:
+      - Rama Medidores (Medidor_1, Medidor_2 y Medidor_3): se detectan y se añaden sus ROIs a la lista de visualización.
+      - Rama Honeywell: se procesa para actualizar datos y dibujar sobre una copia de la ROI global los bounding boxes de las subdetecciones.
+        Sin embargo, si se detecta alguna ROI en la rama de Medidores, se omite la visualización de Honeywell.
+    Se retornan las ROIs finales a visualizar.
     """
-    rois = []
+    rois_medidores = []   # ROIs de Medidor_1, Medidor_2 y Medidor_3
+    rois_honeywell = []   # ROI global de Honeywell con subdetecciones
+
     ih, iw, _ = frame.shape
 
-    # Paso 1: Detectar rf4 usando Display_4.pt
-    results_rf4 = display_4_model(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    labels_rf4 = results_rf4.xyxyn[0][:, -1].cpu().numpy()
-    boxes_rf4  = results_rf4.xyxyn[0][:, :-1].cpu().numpy()
-
-    rf4_present = False
-    for label, box in zip(labels_rf4, boxes_rf4):
-        class_id = int(label)
-        class_name = display_4_model.names[class_id]
-        if class_name == 'rf4':
-            rf4_present = True
-            break  # Solo necesita al menos un rf4
-
-    # Paso 2: Detectar Medidor_4 usando Display_4.pt
-    results_medidor_4 = display_4_model(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    labels_medidor_4 = results_medidor_4.xyxyn[0][:, -1].cpu().numpy()
-    boxes_medidor_4  = results_medidor_4.xyxyn[0][:, :-1].cpu().numpy()
-
-    medidor_4_rois = []
-
-    if rf4_present:
-        for label, box in zip(labels_medidor_4, boxes_medidor_4):
-            class_id = int(label)
-            class_name = display_4_model.names[class_id]
-            if class_name != 'Medidor_4':
-                continue  # Solo procesar Medidor_4
-
-            x1, y1, x2, y2, conf = box
-            x1, y1 = int(x1 * iw), int(y1 * ih)
-            x2, y2 = int(x2 * iw), int(y2 * ih)
-
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            roi = frame[y1:y2, x1:x2].copy()
-            if roi.size == 0:
-                continue
-
-            # Enviar ROI al hilo correspondiente
-            detection_threads['Medidor_4'].queue.put((frame, roi, box))
-
-            # Guardar la ROI para excluirla en Display.pt
-            medidor_4_rois.append([x1, y1, x2, y2])
-
-    # Paso 3: Detectar Medidor_1, Medidor_2, Medidor_3 usando Display.pt
+    # --- Rama Medidores (usando display_model) ---
     results_display = display_model(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     labels_display = results_display.xyxyn[0][:, -1].cpu().numpy()
     boxes_display  = results_display.xyxyn[0][:, :-1].cpu().numpy()
-
+    
+    # Procesamos las detecciones de Medidor_1, Medidor_2 y Medidor_3
     for label, box in zip(labels_display, boxes_display):
-        class_id = int(label)
-        class_name = display_model.names[class_id]
+        class_name = display_model.names[int(label)]
         if class_name not in ['Medidor_1', 'Medidor_2', 'Medidor_3']:
-            continue  # Solo procesar estos medidores
-
+            continue
         x1, y1, x2, y2, conf = box
         x1, y1 = int(x1 * iw), int(y1 * ih)
         x2, y2 = int(x2 * iw), int(y2 * ih)
-
         if x2 <= x1 or y2 <= y1:
             continue
-
-        # Verificar si esta ROI se solapa con alguna de las ROIs de Medidor_4
-        overlap = False
-        for med4_box in medidor_4_rois:
-            iou_val = iou([x1, y1, x2, y2], med4_box)
-            if iou_val > 0.3:  # Ajusta el umbral según sea necesario
-                overlap = True
-                break
-        if overlap:
-            continue  # Excluir esta detección, ya está manejada por Medidor_4
-
         roi = frame[y1:y2, x1:x2].copy()
         if roi.size == 0:
             continue
+        submodel = MEDIDOR_TO_MODEL.get(class_name)
+        if submodel:
+            sub_results = submodel(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+            dets = []
+            has_class_10 = False
+            for d in sub_results.xyxy[0]:
+                xa1, ya1, xa2, yb2, conf_sub, cls_sub = d
+                cls_name = submodel.names[int(cls_sub)]
+                if cls_name == '10':
+                    has_class_10 = True
+                elif conf_sub >= CONFIDENCE_THRESHOLD:
+                    dets.append({
+                        'class': cls_name,
+                        'box': [int(xa1), int(ya1), int(xa2), int(yb2)],
+                        'confidence': float(conf_sub)
+                    })
+            dets = nms(dets, iou_thres=IOU_THRESHOLD)
+            dets_sorted = sorted(dets, key=lambda dd: dd['box'][0])
+            new_digits = ''.join(dd['class'] for dd in dets_sorted)
+            if has_class_10:
+                cv2.rectangle(roi, (0, 0), (roi.shape[1]-1, roi.shape[0]-1), (255, 0, 0), 2)
+                cv2.putText(roi, 'Clase 10 detectada', (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            else:
+                if is_any_valid(class_name, new_digits):
+                    DETECTION_BUFFER[class_name].append(new_digits)
+                    if len(DETECTION_BUFFER[class_name]) > MAX_BUFFER_SIZE:
+                        DETECTION_BUFFER[class_name].pop(0)
+                    confirmed_value = check_consensus(DETECTION_BUFFER[class_name], required_count=CONSENSUS_COUNT)
+                    if confirmed_value:
+                        try:
+                            dato_final = int(confirmed_value)
+                        except ValueError:
+                            print(f"[ERROR] Valor no válido: {confirmed_value}")
+                            continue
+                        HISTORY[class_name].append(dato_final)
+                        print(f"[CONSOLE] {class_name} => {dato_final}")
+                        with LOCK:
+                            if DETECT_ACTIVE:
+                                LAST_CONFIRMED_VALUE["medidor"] = class_name
+                                LAST_CONFIRMED_VALUE["value"] = dato_final
+                                DETECTION_BUFFER[class_name].clear()
+                                try:
+                                    plc_queue.put_nowait(dato_final)
+                                    print(f"[DEBUG] Valor encolado para el PLC: {dato_final}")
+                                except queue.Full:
+                                    print("La cola para el PLC está llena. Se omitirá el dato.")
+            cv2.putText(roi, class_name, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.rectangle(roi, (0, 0), (roi.shape[1]-1, roi.shape[0]-1), (0, 255, 0), 2)
+            rois_medidores.append(roi)
+    
+    # --- Rama Honeywell ---
+    # Solo se procesa si no se detectó ningún Medidor (1, 2 o 3)
+    if not rois_medidores:
+        results_honeywell = display_honeywell_model(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        labels_honeywell = results_honeywell.xyxyn[0][:, -1].cpu().numpy()
+        boxes_honeywell  = results_honeywell.xyxyn[0][:, :-1].cpu().numpy()
+        for label, box in zip(labels_honeywell, boxes_honeywell):
+            class_name = display_honeywell_model.names[int(label)]
+            if class_name != 'honeywell':
+                continue
+            x1, y1, x2, y2, conf = box
+            x1, y1 = int(x1 * iw), int(y1 * ih)
+            x2, y2 = int(x2 * iw), int(y2 * ih)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            roi_honeywell = frame[y1:y2, x1:x2].copy()
+            if roi_honeywell.size == 0:
+                continue
 
-        # Enviar ROI al hilo correspondiente
-        if class_name in detection_threads:
-            detection_threads[class_name].queue.put((frame, roi, box))
+            # Crear una copia sobre la que dibujar sin alterar la ROI original
+            roi_honeywell_copia = roi_honeywell.copy()
 
-    # Recoger ROIs procesadas para visualización
-    for medidor, thread in detection_threads.items():
-        while not thread.processed_rois.empty():
-            processed_roi = thread.processed_rois.get()
-            rois.append(processed_roi)
+            # Procesar subdetecciones en Honeywell (subdisplay)
+            sub_results_honeywell = subdisplay_honeywell_model(cv2.cvtColor(roi_honeywell, cv2.COLOR_BGR2RGB))
+            dets_subdisplay = []
+            has_class_10_honeywell = False
+            for d_sub in sub_results_honeywell.xyxy[0]:
+                xs1, ys1, xs2, ys2, conf_sub, cls_sub = d_sub
+                cls_name_sub = subdisplay_honeywell_model.names[int(cls_sub)]
+                if cls_name_sub == '10':
+                    has_class_10_honeywell = True
+                elif conf_sub >= CONFIDENCE_THRESHOLD:
+                    dets_subdisplay.append({
+                        'class': cls_name_sub,
+                        'box': [int(xs1), int(ys1), int(xs2), int(ys2)],
+                        'confidence': float(conf_sub)
+                    })
+            dets_subdisplay = nms(dets_subdisplay, iou_thres=IOU_THRESHOLD)
+            dets_sorted_subdisplay = sorted(dets_subdisplay, key=lambda dd: dd['box'][0])
+            
+            # Dibujar los bounding boxes de cada subdetección directamente sobre la copia
+            for det in dets_sorted_subdisplay:
+                x_sub1, y_sub1, x_sub2, y_sub2 = det['box']
+                cv2.rectangle(roi_honeywell_copia, (x_sub1, y_sub1), (x_sub2, y_sub2), (255, 255, 0), 2)
+                cv2.putText(roi_honeywell_copia, det['class'], (x_sub1, y_sub1-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
+            
+            # Procesar detección de números en Honeywell
+            numero_honeywell_results = numero_honeywell_model(cv2.cvtColor(roi_honeywell, cv2.COLOR_BGR2RGB))
+            dets_numero_honeywell = []
+            for d_num in numero_honeywell_results.xyxy[0]:
+                xn1, yn1, xn2, yn2, conf_num, cls_num = d_num
+                if conf_num >= CONFIDENCE_THRESHOLD:
+                    cls_name_num = numero_honeywell_model.names[int(cls_num)]
+                    dets_numero_honeywell.append({
+                        'class': cls_name_num,
+                        'box': [int(xn1), int(yn1), int(xn2), int(yn2)],
+                        'confidence': float(conf_num)
+                    })
+            dets_numero_honeywell = nms(dets_numero_honeywell, iou_thres=IOU_THRESHOLD)
+            dets_sorted_numero_honeywell = sorted(dets_numero_honeywell, key=lambda dd: dd['box'][0])
+            filtered_numbers = []
+            for det_num in dets_sorted_numero_honeywell:
+                num_box = det_num['box']
+                num_center = ((num_box[0] + num_box[2]) / 2, (num_box[1] + num_box[3]) / 2)
+                inside = False
+                for det_sub in dets_sorted_subdisplay:
+                    sub_box = det_sub['box']
+                    if (sub_box[0] <= num_center[0] <= sub_box[2]) and (sub_box[1] <= num_center[1] <= sub_box[3]):
+                        inside = True
+                        break
+                if inside:
+                    filtered_numbers.append(det_num)
+            detected_numbers = [det['class'] for det in filtered_numbers]
+            if detected_numbers:
+                numero_detectado = ''.join(detected_numbers)
+                # Se mantiene la lógica para el avance progresivo:
+                # Si el número inicia con '0' se asume que la parte entera es de dos dígitos;
+                # de lo contrario, se asume que es de tres dígitos.
+                if numero_detectado:
+                    if numero_detectado[0] == '0':
+                        pos = 2
+                    else:
+                        pos = 3
+                    if len(numero_detectado) >= pos:
+                        numero_formateado = numero_detectado[:pos] + '.' + numero_detectado[pos:]
+                    else:
+                        numero_formateado = numero_detectado + '.'
+                    # Creamos la variable que indica después de qué dígito se inserta el punto decimal.
+                    punto_posicion = pos
+                    #print(f"[DEBUG] El punto decimal se inserto despues de la posicion: {punto_posicion}")
+                else:
+                    numero_formateado = numero_detectado
 
-    return rois
+                # Convertir el número formateado a entero (eliminando el punto) para enviar al PLC.
+                try:
+                    dato_final = int(numero_formateado.replace('.', ''))
+                except ValueError:
+                    print(f"[ERROR] Valor no válido en honeywell: {numero_formateado}")
+                    dato_final = 0
+                with LOCK:
+                    LAST_CONFIRMED_VALUE["medidor"] = 'honeywell'
+                    LAST_CONFIRMED_VALUE["value"] = dato_final
+                try:
+                    plc_queue.put_nowait(dato_final)
+                    print(f"[DEBUG] honeywell => {dato_final}")
+                except queue.Full:
+                    print("La cola para el PLC está llena. Se omitirá el dato.")
+            cv2.putText(roi_honeywell_copia, 'honeywell', (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.rectangle(roi_honeywell_copia, (0, 0), (roi_honeywell_copia.shape[1]-1, roi_honeywell_copia.shape[0]-1), (0, 255, 0), 2)
+            rois_honeywell.append(roi_honeywell_copia)
+
+    # Condición: Si hay detecciones de Medidores (1,2,3), se retorna únicamente esa rama.
+    # De lo contrario, se retorna la rama Honeywell.
+    if rois_medidores:
+        return rois_medidores
+    else:
+        return rois_honeywell
 
 def combine_rois(rois, max_rois_per_row=4, padding=10):
-    """Combina múltiples ROIs en una sola imagen sin redimensionarlas."""
+    """Combina las ROIs en una sola imagen para la visualización."""
     if not rois:
         blank = np.zeros((300, 400, 3), dtype=np.uint8)
-        cv2.putText(blank, 'No detecciones', (50,150), 
+        cv2.putText(blank, 'No detecciones', (50,150),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
         return blank
-
     rois = rois[: max_rois_per_row * 3]
     num_rois = len(rois)
     num_cols = min(num_rois, max_rois_per_row)
     num_rows = (num_rois + max_rois_per_row - 1) // max_rois_per_row
-
-    widths  = [r.shape[1] for r in rois]
-    heights = [r.shape[0] for r in rois]
-
-    col_widths = [0]*num_cols
+    col_widths = [0] * num_cols
     for i, roi in enumerate(rois):
         c = i % max_rois_per_row
         col_widths[c] = max(col_widths[c], roi.shape[1])
-
-    row_heights = [0]*num_rows
+    row_heights = [0] * num_rows
     for i, roi in enumerate(rois):
         r = i // max_rois_per_row
         row_heights[r] = max(row_heights[r], roi.shape[0])
-
-    total_w = sum(col_widths) + padding*(num_cols+1)
-    total_h = sum(row_heights) + padding*(num_rows+1)
-
+    total_w = sum(col_widths) + padding * (num_cols + 1)
+    total_h = sum(row_heights) + padding * (num_rows + 1)
     combined = np.zeros((total_h, total_w, 3), dtype=np.uint8)
-
     y_off = padding
     idx_roi = 0
     for r in range(num_rows):
@@ -664,12 +549,61 @@ def combine_rois(rois, max_rois_per_row=4, padding=10):
             x_off += col_widths[c] + padding
             idx_roi += 1
         y_off += row_heights[r] + padding
-
     return combined
 
-# =============================================================================
-# MAIN
-# =============================================================================
+###############################################################################
+#                             ENDPOINTS FLASK                                #
+###############################################################################
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+def generate_frames():
+    while True:
+        frame = detection_loop_thread.get_processed_frame()
+        if frame is None:
+            time.sleep(0.01)
+            continue
+        ret, buffer = cv2.imencode('.jpg', frame)
+        frame_bytes = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+@app.route('/start', methods=['GET'])
+def start_detection():
+    global DETECT_ACTIVE
+    with LOCK:
+        DETECT_ACTIVE = True
+    print("[DEBUG] Detección iniciada.")
+    return jsonify({'status': 'detección iniciada'})
+
+@app.route('/data', methods=['GET'])
+def get_data():
+    with LOCK:
+        data = LAST_CONFIRMED_VALUE.copy()
+    return jsonify(data)
+
+@app.route('/stop', methods=['GET'])
+def stop_detection():
+    global DETECT_ACTIVE, LAST_CONFIRMED_VALUE
+    with LOCK:
+        DETECT_ACTIVE = False
+        for medidor in DETECTION_BUFFER:
+            DETECTION_BUFFER[medidor].clear()
+        for medidor in HISTORY:
+            HISTORY[medidor].clear()
+        LAST_CONFIRMED_VALUE["medidor"] = None
+        LAST_CONFIRMED_VALUE["value"] = None
+        print("[DEBUG] Detección detenida. LAST_CONFIRMED_VALUE reiniciado a None.")
+    return jsonify({'status': 'detección detenida y valores reseteados'})
+
+###############################################################################
+#                                 MAIN                                      #
+###############################################################################
 if __name__ == '__main__':
     try:
         app.run(host='0.0.0.0', port=5000, threaded=True)
