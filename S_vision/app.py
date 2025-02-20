@@ -40,7 +40,7 @@ IOU_THRESHOLD = 0.5          # Umbral para NMS
 CONSENSUS_COUNT = 1          # Confirmar detección inmediatamente
 MAX_BUFFER_SIZE = 1          # Tamaño máximo del buffer de lecturas
 
-CAMERA_INDEX = 0             # Índice de la cámara (ajusta según tu sistema)
+CAMERA_INDEX = 2            # Índice de la cámara (ajusta según tu sistema)
 DETECT_ACTIVE = False
 LOCK = threading.Lock()
 
@@ -115,7 +115,7 @@ def check_consensus(buffer_list, required_count=1):
 #          FUNCIONES DE VALIDACIÓN (PROGRESIVA Y ADAPTATIVA)                  #
 ###############################################################################
 def is_progressive_valid(medidor, new_str):
-    if not HISTORY[medidor]:
+    if not HISTORY.get(medidor):
         return True
     try:
         old_val = int(HISTORY[medidor][-1])
@@ -125,7 +125,7 @@ def is_progressive_valid(medidor, new_str):
     return abs(new_val - old_val) <= 2
 
 def is_adaptive_range_valid(medidor, new_str, window=10, k=3):
-    if not HISTORY[medidor]:
+    if not HISTORY.get(medidor):
         return True
     try:
         new_val = int(new_str)
@@ -173,6 +173,10 @@ numero_honeywell_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'nume
 
 # Submodelo para Honeywell
 subdisplay_honeywell_model = load_local_model(os.path.join(DISPLAY_MODELS_DIR, 'subdisplay_honeywell.pt'))
+
+# NUEVOS MODELOS PARA DISPLAY DIGITAL
+display_digital_model = load_local_model(os.path.join(DISPLAY_MODELS_DIR, 'Display_digital.pt'))
+numero_digital_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'numero_digital.pt'))
 
 # Asociar modelos con cada tipo
 MEDIDOR_TO_MODEL = {
@@ -317,13 +321,14 @@ detection_loop_thread.start()
 ###############################################################################
 def detect_display(frame):
     """
-    Esta función procesa dos ramas:
-      - Rama Medidores (Medidor_1, Medidor_2 y Medidor_3): se detectan y se añaden sus ROIs a la lista de visualización.
-      - Rama Honeywell: se procesa para actualizar datos y dibujar sobre una copia de la ROI global los bounding boxes de las subdetecciones.
-        Sin embargo, si se detecta alguna ROI en la rama de Medidores, se omite la visualización de Honeywell.
+    Esta función procesa las diferentes ramas:
+      - Rama Medidores (Medidor_1, Medidor_2 y Medidor_3)
+      - Rama Display Digital (nuevo modelo)
+      - Rama Honeywell (procesada si no se detectan Medidores o Display Digital)
     Se retornan las ROIs finales a visualizar.
     """
     rois_medidores = []   # ROIs de Medidor_1, Medidor_2 y Medidor_3
+    rois_digital = []     # ROIs del Display Digital
     rois_honeywell = []   # ROI global de Honeywell con subdetecciones
 
     ih, iw, _ = frame.shape
@@ -333,7 +338,6 @@ def detect_display(frame):
     labels_display = results_display.xyxyn[0][:, -1].cpu().numpy()
     boxes_display  = results_display.xyxyn[0][:, :-1].cpu().numpy()
     
-    # Procesamos las detecciones de Medidor_1, Medidor_2 y Medidor_3
     for label, box in zip(labels_display, boxes_display):
         class_name = display_model.names[int(label)]
         if class_name not in ['Medidor_1', 'Medidor_2', 'Medidor_3']:
@@ -388,19 +392,89 @@ def detect_display(frame):
                                 LAST_CONFIRMED_VALUE["medidor"] = class_name
                                 LAST_CONFIRMED_VALUE["value"] = dato_final
                                 DETECTION_BUFFER[class_name].clear()
-                                try:
-                                    plc_queue.put_nowait(dato_final)
-                                    print(f"[DEBUG] Valor encolado para el PLC: {dato_final}")
-                                except queue.Full:
-                                    print("La cola para el PLC está llena. Se omitirá el dato.")
+                        try:
+                            plc_queue.put_nowait(dato_final)
+                            print(f"[DEBUG] Valor encolado para el PLC: {dato_final}")
+                        except queue.Full:
+                            print("La cola para el PLC está llena. Se omitirá el dato.")
             cv2.putText(roi, class_name, (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             cv2.rectangle(roi, (0, 0), (roi.shape[1]-1, roi.shape[0]-1), (0, 255, 0), 2)
             rois_medidores.append(roi)
     
+    # --- Rama Display Digital (nuevo modelo) ---
+    results_digital = display_digital_model(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    labels_digital = results_digital.xyxyn[0][:, -1].cpu().numpy()
+    boxes_digital  = results_digital.xyxyn[0][:, :-1].cpu().numpy()
+    
+    for label, box in zip(labels_digital, boxes_digital):
+        class_name = display_digital_model.names[int(label)]
+        if class_name != 'display_digital':
+            continue
+        x1, y1, x2, y2, conf = box
+        if conf < 0.7:
+            continue
+        x1, y1 = int(x1 * iw), int(y1 * ih)
+        x2, y2 = int(x2 * iw), int(y2 * ih)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        roi_digital = frame[y1:y2, x1:x2].copy()
+        if roi_digital.size == 0:
+            continue
+
+        # --- Subdetección con numero_digital ---
+        results_num_digital = numero_digital_model(cv2.cvtColor(roi_digital, cv2.COLOR_BGR2RGB))
+        dets = []
+        for d in results_num_digital.xyxy[0]:
+            xa1, ya1, xa2, yb2, conf_sub, cls_sub = d
+            if conf_sub >= CONFIDENCE_THRESHOLD:
+                cls_name_digit = numero_digital_model.names[int(cls_sub)]
+                dets.append({
+                    'class': cls_name_digit,
+                    'box': [int(xa1), int(ya1), int(xa2), int(yb2)],
+                    'confidence': float(conf_sub)
+                })
+        dets = nms(dets, iou_thres=IOU_THRESHOLD)
+        dets_sorted = sorted(dets, key=lambda dd: dd['box'][0])
+        new_digits = ''.join(dd['class'] for dd in dets_sorted)
+        
+        cv2.putText(roi_digital, new_digits, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.rectangle(roi_digital, (0, 0), (roi_digital.shape[1]-1, roi_digital.shape[0]-1), (0, 255, 0), 2)
+        rois_digital.append(roi_digital)
+        
+        # Validación similar a otros medidores: se actualiza el valor solo si se detectan 8 dígitos;
+        # en caso contrario, se mantiene el último valor confirmado.
+        if is_any_valid('Display_digital', new_digits):
+            DETECTION_BUFFER.setdefault('Display_digital', [])
+            DETECTION_BUFFER['Display_digital'].append(new_digits)
+            if len(DETECTION_BUFFER['Display_digital']) > MAX_BUFFER_SIZE:
+                DETECTION_BUFFER['Display_digital'].pop(0)
+            confirmed_value = check_consensus(DETECTION_BUFFER['Display_digital'], required_count=CONSENSUS_COUNT)
+            if confirmed_value:
+                try:
+                    dato_final = int(confirmed_value)
+                except ValueError:
+                    print(f"[ERROR] Valor no válido en Display_digital: {confirmed_value}")
+                    continue
+                # Actualizamos solo si el número detectado tiene exactamente 8 dígitos (sin el punto)
+                if len(confirmed_value) == 8:
+                    HISTORY.setdefault('Display_digital', []).append(dato_final)
+                    print(f"[CONSOLE] Display_digital => {dato_final}")
+                    with LOCK:
+                        LAST_CONFIRMED_VALUE["medidor"] = 'Display_digital'
+                        LAST_CONFIRMED_VALUE["value"] = dato_final
+                        DETECTION_BUFFER['Display_digital'].clear()
+                    try:
+                        plc_queue.put_nowait(dato_final)
+                        print(f"[DEBUG] Display_digital => {dato_final}")
+                    except queue.Full:
+                        print("La cola para el PLC está llena. Se omitirá el dato.")
+                # Si no tiene 8 dígitos, se conserva el valor anterior.
+    
     # --- Rama Honeywell ---
-    # Solo se procesa si no se detectó ningún Medidor (1, 2 o 3)
-    if not rois_medidores:
+    # Se procesa solo si no se detectaron Medidores ni Display Digital
+    if not rois_medidores and not rois_digital:
         results_honeywell = display_honeywell_model(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         labels_honeywell = results_honeywell.xyxyn[0][:, -1].cpu().numpy()
         boxes_honeywell  = results_honeywell.xyxyn[0][:, :-1].cpu().numpy()
@@ -417,10 +491,8 @@ def detect_display(frame):
             if roi_honeywell.size == 0:
                 continue
 
-            # Crear una copia sobre la que dibujar sin alterar la ROI original
             roi_honeywell_copia = roi_honeywell.copy()
 
-            # Procesar subdetecciones en Honeywell (subdisplay)
             sub_results_honeywell = subdisplay_honeywell_model(cv2.cvtColor(roi_honeywell, cv2.COLOR_BGR2RGB))
             dets_subdisplay = []
             has_class_10_honeywell = False
@@ -438,14 +510,12 @@ def detect_display(frame):
             dets_subdisplay = nms(dets_subdisplay, iou_thres=IOU_THRESHOLD)
             dets_sorted_subdisplay = sorted(dets_subdisplay, key=lambda dd: dd['box'][0])
             
-            # Dibujar los bounding boxes de cada subdetección directamente sobre la copia
             for det in dets_sorted_subdisplay:
                 x_sub1, y_sub1, x_sub2, y_sub2 = det['box']
                 cv2.rectangle(roi_honeywell_copia, (x_sub1, y_sub1), (x_sub2, y_sub2), (255, 255, 0), 2)
                 cv2.putText(roi_honeywell_copia, det['class'], (x_sub1, y_sub1-10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
             
-            # Procesar detección de números en Honeywell
             numero_honeywell_results = numero_honeywell_model(cv2.cvtColor(roi_honeywell, cv2.COLOR_BGR2RGB))
             dets_numero_honeywell = []
             for d_num in numero_honeywell_results.xyxy[0]:
@@ -474,8 +544,6 @@ def detect_display(frame):
             detected_numbers = [det['class'] for det in filtered_numbers]
             if detected_numbers:
                 numero_detectado = ''.join(detected_numbers)
-                # Usar la variable global initial_dot_pos para definir la posición del punto.
-                # Si el número detectado inicia con '0' se usa initial_dot_pos, de lo contrario se suma 1.
                 if numero_detectado:
                     if numero_detectado[0] == '0':
                         pos = initial_dot_pos
@@ -486,36 +554,40 @@ def detect_display(frame):
                     else:
                         numero_formateado = numero_detectado + '.'
                     print(f"[DEBUG] El punto decimal se insertó después del dígito: {pos}")
-                    # Mostrar en consola el número detectado con el punto decimal
                     print(f"[DEBUG] Número detectado (con punto): {numero_formateado}")
                 else:
                     numero_formateado = numero_detectado
 
-                # Convertir el número formateado a entero (eliminando el punto) para enviar al PLC.
-                try:
-                    dato_final = int(numero_formateado.replace('.', ''))
-                except ValueError:
-                    print(f"[ERROR] Valor no válido en honeywell: {numero_formateado}")
-                    dato_final = 0
-                # Mostrar en consola ambos valores: con punto y el entero
-                print(f"[DEBUG] Número detectado: {numero_formateado} (String), {dato_final} (Entero)")
-                with LOCK:
-                    LAST_CONFIRMED_VALUE["medidor"] = 'honeywell'
-                    LAST_CONFIRMED_VALUE["value"] = dato_final
-                try:
-                    plc_queue.put_nowait(dato_final)
+                # Aquí extraemos los 3 dígitos a la derecha del punto
+                parts = numero_formateado.split('.')
+                if len(parts) >= 2 and len(parts[1]) >= 3:
+                    right_part = parts[1][:3]
+                    try:
+                        dato_final = int(right_part)
+                    except ValueError:
+                        print("[ERROR] No se pudo convertir la parte derecha a entero.")
+                        dato_final = 0
                     print(f"[DEBUG] honeywell => {dato_final}")
-                except queue.Full:
-                    print("La cola para el PLC está llena. Se omitirá el dato.")
+                    with LOCK:
+                        LAST_CONFIRMED_VALUE["medidor"] = 'honeywell'
+                        LAST_CONFIRMED_VALUE["value"] = dato_final
+                    try:
+                        plc_queue.put_nowait(dato_final)
+                        print(f"[DEBUG] honeywell => {dato_final}")
+                    except queue.Full:
+                        print("La cola para el PLC está llena. Se omitirá el dato.")
+                else:
+                    print("[DEBUG] No se detectaron 3 dígitos a la derecha del punto en honeywell, se conserva el valor anterior.")
             cv2.putText(roi_honeywell_copia, 'honeywell', (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             cv2.rectangle(roi_honeywell_copia, (0, 0), (roi_honeywell_copia.shape[1]-1, roi_honeywell_copia.shape[0]-1), (0, 255, 0), 2)
             rois_honeywell.append(roi_honeywell_copia)
 
-    # Condición: Si hay detecciones de Medidores (1,2,3), se retorna únicamente esa rama.
-    # De lo contrario, se retorna la rama Honeywell.
-    if rois_medidores:
-        return rois_medidores
+    # Combinar las detecciones:
+    # Si existen detecciones en Medidores o Display Digital se muestran ambas,
+    # de lo contrario se muestra la rama Honeywell.
+    if rois_medidores or rois_digital:
+        return rois_medidores + rois_digital
     else:
         return rois_honeywell
 
@@ -577,7 +649,6 @@ def generate_frames():
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
-# Ruta para actualizar la posición inicial del punto decimal usando parámetros en la URL.
 @app.route('/set_dot_position', methods=['GET'])
 def set_dot_position():
     global initial_dot_pos
