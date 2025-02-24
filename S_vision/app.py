@@ -40,7 +40,7 @@ IOU_THRESHOLD = 0.5          # Umbral para NMS
 CONSENSUS_COUNT = 1          # Confirmar detección inmediatamente
 MAX_BUFFER_SIZE = 1          # Tamaño máximo del buffer de lecturas
 
-CAMERA_INDEX = 2            # Índice de la cámara (ajusta según tu sistema)
+CAMERA_INDEX = 0             # Índice de la cámara (ajusta según tu sistema)
 DETECT_ACTIVE = False
 LOCK = threading.Lock()
 
@@ -385,18 +385,19 @@ def detect_display(frame):
                         except ValueError:
                             print(f"[ERROR] Valor no válido: {confirmed_value}")
                             continue
-                        HISTORY[class_name].append(dato_final)
-                        print(f"[CONSOLE] {class_name} => {dato_final}")
-                        with LOCK:
-                            if DETECT_ACTIVE:
+                        # Solo enviar si el nuevo dato es diferente del último confirmado
+                        if LAST_CONFIRMED_VALUE["value"] != dato_final:
+                            HISTORY[class_name].append(dato_final)
+                            print(f"[CONSOLE] {class_name} => {dato_final}")
+                            with LOCK:
                                 LAST_CONFIRMED_VALUE["medidor"] = class_name
                                 LAST_CONFIRMED_VALUE["value"] = dato_final
                                 DETECTION_BUFFER[class_name].clear()
-                        try:
-                            plc_queue.put_nowait(dato_final)
-                            print(f"[DEBUG] Valor encolado para el PLC: {dato_final}")
-                        except queue.Full:
-                            print("La cola para el PLC está llena. Se omitirá el dato.")
+                            try:
+                                plc_queue.put_nowait(dato_final)
+                                print(f"[DEBUG] Valor encolado para el PLC: {dato_final}")
+                            except queue.Full:
+                                print("La cola para el PLC está llena. Se omitirá el dato.")
             cv2.putText(roi, class_name, (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             cv2.rectangle(roi, (0, 0), (roi.shape[1]-1, roi.shape[0]-1), (0, 255, 0), 2)
@@ -443,8 +444,7 @@ def detect_display(frame):
         cv2.rectangle(roi_digital, (0, 0), (roi_digital.shape[1]-1, roi_digital.shape[0]-1), (0, 255, 0), 2)
         rois_digital.append(roi_digital)
         
-        # Validación similar a otros medidores: se actualiza el valor solo si se detectan 8 dígitos;
-        # en caso contrario, se mantiene el último valor confirmado.
+        # Validación: solo se actualiza si el número detectado (sin punto) tiene 8 dígitos
         if is_any_valid('Display_digital', new_digits):
             DETECTION_BUFFER.setdefault('Display_digital', [])
             DETECTION_BUFFER['Display_digital'].append(new_digits)
@@ -457,19 +457,20 @@ def detect_display(frame):
                 except ValueError:
                     print(f"[ERROR] Valor no válido en Display_digital: {confirmed_value}")
                     continue
-                # Actualizamos solo si el número detectado tiene exactamente 8 dígitos (sin el punto)
+                # Solo se actualiza si el número detectado tiene exactamente 8 dígitos (sin punto)
                 if len(confirmed_value) == 8:
-                    HISTORY.setdefault('Display_digital', []).append(dato_final)
-                    print(f"[CONSOLE] Display_digital => {dato_final}")
-                    with LOCK:
-                        LAST_CONFIRMED_VALUE["medidor"] = 'Display_digital'
-                        LAST_CONFIRMED_VALUE["value"] = dato_final
-                        DETECTION_BUFFER['Display_digital'].clear()
-                    try:
-                        plc_queue.put_nowait(dato_final)
-                        print(f"[DEBUG] Display_digital => {dato_final}")
-                    except queue.Full:
-                        print("La cola para el PLC está llena. Se omitirá el dato.")
+                    if LAST_CONFIRMED_VALUE["value"] != dato_final:
+                        HISTORY.setdefault('Display_digital', []).append(dato_final)
+                        print(f"[CONSOLE] Display_digital => {dato_final}")
+                        with LOCK:
+                            LAST_CONFIRMED_VALUE["medidor"] = 'Display_digital'
+                            LAST_CONFIRMED_VALUE["value"] = dato_final
+                            DETECTION_BUFFER['Display_digital'].clear()
+                        try:
+                            plc_queue.put_nowait(dato_final)
+                            print(f"[DEBUG] Display_digital => {dato_final}")
+                        except queue.Full:
+                            print("La cola para el PLC está llena. Se omitirá el dato.")
                 # Si no tiene 8 dígitos, se conserva el valor anterior.
     
     # --- Rama Honeywell ---
@@ -558,7 +559,7 @@ def detect_display(frame):
                 else:
                     numero_formateado = numero_detectado
 
-                # Aquí extraemos los 3 dígitos a la derecha del punto
+                # Extraer los 3 dígitos a la derecha del punto
                 parts = numero_formateado.split('.')
                 if len(parts) >= 2 and len(parts[1]) >= 3:
                     right_part = parts[1][:3]
@@ -567,15 +568,17 @@ def detect_display(frame):
                     except ValueError:
                         print("[ERROR] No se pudo convertir la parte derecha a entero.")
                         dato_final = 0
-                    print(f"[DEBUG] honeywell => {dato_final}")
-                    with LOCK:
-                        LAST_CONFIRMED_VALUE["medidor"] = 'honeywell'
-                        LAST_CONFIRMED_VALUE["value"] = dato_final
-                    try:
-                        plc_queue.put_nowait(dato_final)
+                    # Solo enviar si el nuevo dato es diferente al último confirmado
+                    if LAST_CONFIRMED_VALUE["value"] != dato_final:
                         print(f"[DEBUG] honeywell => {dato_final}")
-                    except queue.Full:
-                        print("La cola para el PLC está llena. Se omitirá el dato.")
+                        with LOCK:
+                            LAST_CONFIRMED_VALUE["medidor"] = 'honeywell'
+                            LAST_CONFIRMED_VALUE["value"] = dato_final
+                        try:
+                            plc_queue.put_nowait(dato_final)
+                            print(f"[DEBUG] honeywell => {dato_final}")
+                        except queue.Full:
+                            print("La cola para el PLC está llena. Se omitirá el dato.")
                 else:
                     print("[DEBUG] No se detectaron 3 dígitos a la derecha del punto en honeywell, se conserva el valor anterior.")
             cv2.putText(roi_honeywell_copia, 'honeywell', (10, 30),
