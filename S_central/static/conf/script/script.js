@@ -22,6 +22,21 @@ function activateDetection() {
     });
 }
 
+function reiniciarEquipos() {
+    if (!confirm("¿Estás seguro de que quieres reiniciar todos los dispositivos?")) return;
+
+    fetch("/reboot_all")
+        .then(response => response.json())
+        .then(data => {
+            console.log("Reinicio completado:", data);
+            alert("Comando de reinicio enviado a todos los dispositivos.");
+        })
+        .catch(error => {
+            console.error("Error en reinicio global", error);
+            alert("Error al reiniciar los dispositivos.");
+        });
+}
+
 // Función para detener detección
 function detenerDeteccion() {
     devices.forEach(device => {
