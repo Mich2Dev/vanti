@@ -7,8 +7,7 @@
   <title>Live Monitoring Dashboard</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='conf/style/style.css') }}">
   <style>
-    /* (Aquí se colocan tus estilos existentes) */
-    /* Por ejemplo: */
+    /* Estilos originales */
     body { font-family: Arial, sans-serif; background-color: #0D0D0D; color: #DADADA; }
     .container-fluid { max-width: 1200px; margin: 20px auto; padding: 20px; background-color: #1C1C1C; border-radius: 10px; }
     .row { display: flex; justify-content: space-between; margin-bottom: 20px; }
@@ -19,12 +18,39 @@
     .btn-container { text-align: center; margin-top: 30px; }
     .btn { font-size: 1.3em; padding: 15px 40px; margin: 0 20px; border: none; border-radius: 8px; cursor: pointer; background-color: #333; color: #00A1E4; }
     .btn-detener { background-color: #D32F2F; }
+    .btn-detener1 { background-color: #FFA500; /* Naranja */
+}
+
+    /* Nuevo estilo para el botón toggle individual */
+    .btn-toggle {
+      font-size: 0.9em;
+      padding: 5px 10px;
+      margin-top: 5px;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      background-color: #FFA500;
+      color: #fff;
+      transition: background-color 0.3s ease;
+    }
+    .btn-toggle:hover { background-color: #e59400; }
+    /* Contenedor de logos: coloca el primer logo a la izquierda y el segundo a la derecha */
+    .logo-container {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+    }
+    .logo-container img {
+      max-height: 80px;
+    }
   </style>
 </head>
 <body>
   <div class="container-fluid">
     <div class="logo-container">
       <img src="{{ url_for('static', filename='conf/img/logo.png') }}" alt="Logo de la empresa">
+      <img src="{{ url_for('static', filename='conf/img/logo2.png') }}" alt="Logo 2">
     </div>
 
     <h1>Monitoring System</h1>
@@ -33,25 +59,22 @@
     <div class="row">
       <div class="img-container">
         <span class="img-label">Camera 1</span>
-        <img id="img1" src="http://127.0.0.1:5000/video_feed" alt="Camera 1 Stream">
+        <img id="img1" src="http://192.168.0.51:5000/video_feed" alt="Camera 1 Stream">
         <h2 id="current_cam1">{{dato1}}</h2>
-        <!-- Input y botón para la posición del punto -->
-        <input type="number" id="input_cam1" placeholder="Posición del punto" min="1">
-        <button onclick="updateDotPosition('127.0.0.1', 5000, 'input_cam1')">Cargar Posición</button>
+        <!-- Se agregan atributos data-ip y data-port para identificar cada cámara -->
+        <button class="btn-toggle" data-active="true" data-ip="192.168.0.51" data-port="5000" onclick="toggleDetection(this, 'Camera 1')">Stop</button>
       </div>
       <div class="img-container">
         <span class="img-label">Camera 2</span>
-        <img id="img2" src="http://192.168.0.42:5000/video_feed" alt="Camera 2 Stream">
+        <img id="img2" src="http://192.168.0.52:5000/video_feed" alt="Camera 2 Stream">
         <h2 id="current_cam2">{{dato2}}</h2>
-        <input type="number" id="input_cam2" placeholder="Posición del punto" min="1">
-        <button onclick="updateDotPosition('192.168.0.42', 5000, 'input_cam2')">Cargar Posición</button>
+        <button class="btn-toggle" data-active="true" data-ip="192.168.0.52" data-port="5000" onclick="toggleDetection(this, 'Camera 2')">Stop</button>
       </div>
       <div class="img-container">
         <span class="img-label">Camera 3</span>
-        <img id="img3" src="http://192.168.0.43:5000/video_feed" alt="Camera 3 Stream">
+        <img id="img3" src="http://192.168.0.53:5000/video_feed" alt="Camera 3 Stream">
         <h2 id="current_cam3">{{dato3}}</h2>
-        <input type="number" id="input_cam3" placeholder="Posición del punto" min="1">
-        <button onclick="updateDotPosition('192.168.0.43', 5000, 'input_cam3')">Cargar Posición</button>
+        <button class="btn-toggle" data-active="true" data-ip="192.168.0.53" data-port="5000" onclick="toggleDetection(this, 'Camera 3')">Stop</button>
       </div>
     </div>
 
@@ -59,35 +82,113 @@
     <div class="row">
       <div class="img-container">
         <span class="img-label">Camera 4</span>
-        <img id="img4" src="http://192.168.0.44:5000/video_feed" alt="Camera 4 Stream">
+        <img id="img4" src="http://192.168.0.54:5000/video_feed" alt="Camera 4 Stream">
         <h2 id="current_cam4">{{dato4}}</h2>
-        <input type="number" id="input_cam4" placeholder="Posición del punto" min="1">
-        <button onclick="updateDotPosition('192.168.0.44', 5000, 'input_cam4')">Cargar Posición</button>
+        <button class="btn-toggle" data-active="true" data-ip="192.168.0.54" data-port="5000" onclick="toggleDetection(this, 'Camera 4')">Stop</button>
       </div>
       <div class="img-container">
         <span class="img-label">Camera 5</span>
-        <img id="img5" src="http://192.168.0.45:5000/video_feed" alt="Camera 5 Stream">
+        <img id="img5" src="http://192.168.0.55:5000/video_feed" alt="Camera 5 Stream">
         <h2 id="current_cam5">{{dato5}}</h2>
-        <input type="number" id="input_cam5" placeholder="Posición del punto" min="1">
-        <button onclick="updateDotPosition('192.168.0.45', 5000, 'input_cam5')">Cargar Posición</button>
+        <button class="btn-toggle" data-active="true" data-ip="192.168.0.55" data-port="5000" onclick="toggleDetection(this, 'Camera 5')">Stop</button>
       </div>
       <div class="img-container">
         <span class="img-label">Camera 6</span>
-        <img id="img6" src="http://192.168.0.80:5000/video_feed" alt="Camera 6 Stream">
+        <img id="img6" src="http://192.168.0.56:5000/video_feed" alt="Camera 6 Stream">
         <h2 id="current_cam6">{{dato6}}</h2>
-        <input type="number" id="input_cam6" placeholder="Posición del punto" min="1">
-        <button onclick="updateDotPosition('192.168.0.80', 5000, 'input_cam6')">Cargar Posición</button>
+        <button class="btn-toggle" data-active="true" data-ip="192.168.0.56" data-port="5000" onclick="toggleDetection(this, 'Camera 6')">Stop</button>
       </div>
     </div>
-
+    
+    <!-- Tercera fila de cámaras -->
+    <div class="row">
+      <div class="img-container">
+        <span class="img-label">Camera 7</span>
+        <img id="img7" src="http://192.168.0.57:5000/video_feed" alt="Camera 7 Stream">
+        <h2 id="current_cam7">{{dato7}}</h2>
+        <button class="btn-toggle" data-active="true" data-ip="192.168.0.57" data-port="5000" onclick="toggleDetection(this, 'Camera 7')">Stop</button>
+      </div>
+      <div class="img-container">
+        <span class="img-label">Camera 8</span>
+        <img id="img8" src="http://192.168.0.58:5000/video_feed" alt="Camera 8 Stream">
+        <h2 id="current_cam8">{{dato8}}</h2>
+        <button class="btn-toggle" data-active="true" data-ip="192.168.0.58" data-port="5000" onclick="toggleDetection(this, 'Camera 8')">Stop</button>
+      </div>
+    </div>
+    
     <!-- Contenedor de botones generales -->
     <div class="btn-container">
       <button class="btn" id="startBtn" onclick="activateDetection()">Iniciar</button>
-      <button class="btn btn-detener" onclick="detenerDeteccion()">Detener</button>
+      <button class="btn btn-detener1" onclick="detenerDeteccion()">Detener</button>
+      <button class="btn btn-detener" onclick="reiniciarEquipos()">Reiniciar Equipos</button>
+
     </div>
   </div>
+  <script>
+    // Almacena la clave para cada botón según IP y puerto
+    function getStorageKey(ip, port) {
+      return 'toggle_' + ip + '_' + port;
+    }
 
-  <!-- Incluye el script.js -->
+    // Función toggle: si está activa, se detiene; si está detenida, se inicia.
+    function toggleDetection(btn, name) {
+      const ip = btn.dataset.ip;
+      const port = btn.dataset.port;
+      const key = getStorageKey(ip, port);
+      
+      if (btn.dataset.active === "true") {
+        fetch("http://" + ip + ":" + port + "/stop")
+          .then(response => response.json())
+          .then(data => {
+            console.log(name + ": Detección detenida");
+            btn.innerText = "Start";
+            btn.dataset.active = "false";
+            localStorage.setItem(key, "false");
+          })
+          .catch(error => {
+            console.error(name + ": Error al detener detección", error);
+          });
+      } else {
+        fetch("http://" + ip + ":" + port + "/start")
+          .then(response => response.json())
+          .then(data => {
+            console.log(name + ": Detección iniciada");
+            btn.innerText = "Stop";
+            btn.dataset.active = "true";
+            localStorage.setItem(key, "true");
+          })
+          .catch(error => {
+            console.error(name + ": Error al iniciar detección", error);
+          });
+      }
+    }
+    
+    // Al cargar la página se sincronizan los botones según lo almacenado en localStorage.
+    document.addEventListener("DOMContentLoaded", function() {
+      const buttons = document.querySelectorAll('.btn-toggle');
+      buttons.forEach(btn => {
+        const ip = btn.dataset.ip;
+        const port = btn.dataset.port;
+        const key = getStorageKey(ip, port);
+        // Si hay un valor guardado, actualiza el botón
+        const storedState = localStorage.getItem(key);
+        if (storedState !== null) {
+          if (storedState === "true") {
+            btn.innerText = "Stop";
+            btn.dataset.active = "true";
+          } else {
+            btn.innerText = "Start";
+            btn.dataset.active = "false";
+          }
+        }
+      });
+    });
+    
+    // Recarga automática cada 2 minutos
+    setTimeout(function(){
+      document.location.reload();
+    }, 200000);
+  </script>
   <script src="{{ url_for('static', filename='conf/script/script.js') }}"></script>
 </body>
 </html>
