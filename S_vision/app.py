@@ -1,678 +1,647 @@
-import snap7
-from snap7.util import get_bool, set_bool
-import struct
-import csv
-import time
-import logging
+import cv2
+import torch
+import numpy as np
+import statistics
+from flask import Flask, render_template, Response, jsonify
 import threading
-from flask import Flask, request, jsonify
-import atexit
+from flask_cors import CORS
+import warnings
 import os
+import struct
+import snap7
+from snap7.util import *
+import time
+import atexit
+import sys
+import logging
+import requests  # Para enviar datos al servicio de calibración
 
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+# Configuración de logging
+logging.basicConfig(
+    level=logging.INFO,  # Cambia a DEBUG para más detalles
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("app.log"),
+        logging.StreamHandler()
+    ]
+)
+sys.stderr = open('snap7_errors.log', 'w')
 
-# ------------------------------------------------------------------------------
-#                   CONFIGURACIÓN DE PARAMETROS GENERALES
-# ------------------------------------------------------------------------------
-PLC_IP = '192.168.0.10'
-PLC_RACK = 0
-PLC_SLOT = 1
+###############################################################################
+#                        IGNORAR LOS FUTUREWARNING DE TORCH                   #
+###############################################################################
+warnings.filterwarnings("ignore", category=FutureWarning)
 
+###############################################################################
+#                           CONFIGURACIÓN GENERAL                             #
+###############################################################################
+CONFIDENCE_THRESHOLD = 0.3  # Umbral de confianza para submodelos
+IOU_THRESHOLD = 0.3       # Umbral para NMS
+CONSENSUS_COUNT = 0         # Confirmar detección inmediatamente
+MAX_BUFFER_SIZE = 1         # Tamaño máximo del buffer de lecturas
 
+CAMERA_INDEX = 2          # Índice de la cámara (ajusta según tu sistema)
+DETECT_ACTIVE = False
+LOCK = threading.Lock()
 
+# Último valor confirmado para evitar envíos repetidos
+LAST_CONFIRMED_VALUE = {"medidor": None, "value": None}
 
-# Hasta cuántas repeticiones manejar (1 a 10)
-NUM_REPETICIONES = 10
-print('TOMA TUS REPETICIONES')
-  # Se implementan hasta 10 repeticiones
-# Incremento (litro) que marca el inicio de cada repetición
-GAP = 2  
-# Nombre del test (opcional, para logs)
-TEST = "calentamiento"
+# Para formatear el número en Honeywell
+initial_dot_pos = 2
 
-# ------------------------------------------------------------------------------
-#                   CONFIGURACIÓN DE DB PARA BANDERA / LECTURAS
-# ------------------------------------------------------------------------------
-FLAG_DB = 25
-FLAG_OFFSET = 20  # DBX8.0 (bool)
+# Variable global para almacenar la última imagen válida (para el stream)
+LAST_VALID_FRAME = None
 
-
-
-PATTERN_DB = 25
-PATTERN_OFFSET = 16  # Se lee como FLOAT
-
-SETPOINT_DB = 3
-SETPOINT_OFFSET = 22  # Se lee como INT
-
-# ------------------------------------------------------------------------------
-#                   CONFIGURACIÓN DE SALIDA A CSV
-# ------------------------------------------------------------------------------
-CSV_FILE = "calibracion.csv"
-CSV_HEADER = ["Evento", "Tipo", "Valor", "Valor_Inicial", "Diferencia", "Setpoint", "Timestamp"]
-
-# ------------------------------------------------------------------------------
-#                   DICCIONARIOS PARA ESCRIBIR EN EL PLC (PARÁMETRICO)
-# ------------------------------------------------------------------------------
-CAMERA_DB_MAP = {
-    "MR1I":  {"db": 31, "offset": 128,   "type": "float"},
-    "MR1F":  {"db": 31, "offset": 132,  "type": "float"},
-    "MR2I":  {"db": 31, "offset": 136,  "type": "float"},
-    "MR2F":  {"db": 31, "offset": 140,  "type": "float"},
-    "MR3I":  {"db": 31, "offset": 144,  "type": "float"},
-    "MR3F":  {"db": 31, "offset": 148,  "type": "float"},
-    "MR4I":  {"db": 31, "offset": 152,  "type": "float"},
-    "MR4F":  {"db": 31, "offset": 156,  "type": "float"},
-    "MR5I":  {"db": 31, "offset": 160,  "type": "float"},
-    "MR5F":  {"db": 31, "offset": 164,  "type": "float"},
-    "MR6I":  {"db": 31, "offset": 168,  "type": "float"},
-    "MR6F":  {"db": 31, "offset": 172,  "type": "float"},
-    "MR7I":  {"db": 31, "offset": 176,  "type": "float"},
-    "MR7F":  {"db": 31, "offset": 180,  "type": "float"},
-    "MR8I":  {"db": 31, "offset": 184,  "type": "float"},
-    "MR8F":  {"db": 31, "offset": 188,  "type": "float"},
-    "MR9I":  {"db": 31, "offset": 192,  "type": "float"},
-    "MR9F":  {"db": 31, "offset": 196,  "type": "float"},
-    "MR10I": {"db": 31, "offset": 200,  "type": "float"},
-    "MR10F": {"db": 31, "offset": 204,  "type": "float"},
+###############################################################################
+#                 HISTORIAL Y BUFFERS PARA CADA RAMA                           #
+###############################################################################
+HISTORY = {
+    'Medidor_1': [], 
+    'Medidor_2': [], 
+    'Medidor_3': [], 
+    'Display_digital': [], 
+    'honeywell': []
+}
+DETECTION_BUFFER = {
+    'Medidor_1': [], 
+    'Medidor_2': [], 
+    'Medidor_3': [], 
+    'Display_digital': [], 
+    'honeywell': []
 }
 
-PATTERN_DB_MAP = {
-    "MP1I":  {"db": 31, "offset": 208,  "type": "float"},
-    "MP1F":  {"db": 31, "offset": 212,  "type": "float"},
-    "MP2I":  {"db": 31, "offset": 216,  "type": "float"},
-    "MP2F":  {"db": 31, "offset": 220,  "type": "float"},
-    "MP3I":  {"db": 31, "offset": 224,  "type": "float"},
-    "MP3F":  {"db": 31, "offset": 228,  "type": "float"},
-    "MP4I":  {"db": 31, "offset": 232,  "type": "float"},
-    "MP4F":  {"db": 31, "offset": 236,  "type": "float"},
-    "MP5I":  {"db": 31, "offset": 240,  "type": "float"},
-    "MP5F":  {"db": 31, "offset": 244,  "type": "float"},
-    "MP6I":  {"db": 31, "offset": 248,  "type": "float"},
-    "MP6F":  {"db": 31, "offset": 252,  "type": "float"},
-    "MP7I":  {"db": 31, "offset": 256,  "type": "float"},
-    "MP7F":  {"db": 31, "offset": 260,  "type": "float"},
-    "MP8I":  {"db": 31, "offset": 264,  "type": "float"},
-    "MP8F":  {"db": 31, "offset": 268,  "type": "float"},
-    "MP9I":  {"db": 31, "offset": 272,  "type": "float"},
-    "MP9F":  {"db": 31, "offset": 276,  "type": "float"},
-    "MP10I": {"db": 31, "offset": 280,  "type": "float"},
-    "MP10F": {"db": 31, "offset": 284,  "type": "float"},
-}
+###############################################################################
+#                    FUNCIONES AUXILIARES Y DE VALIDACIÓN                     #
+###############################################################################
+def load_local_model(pt_file: str):
+    """Carga un modelo YOLOv5 local usando torch.hub.load."""
+    if not os.path.exists(pt_file):
+        raise FileNotFoundError(f"El modelo no se encontró en la ruta: {pt_file}")
+    return torch.hub.load('./yolov5', 'custom', path=pt_file, source='local', force_reload=False)
 
-# ------------------------------------------------------------------------------
-#                   VARIABLES / OBJETOS GLOBALES
-# ------------------------------------------------------------------------------
-cliente_plc = snap7.client.Client()
-conectado_plc = False
+def iou(boxA, boxB):
+    """Cálculo simple de Intersection Over Union (IOU)."""
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    inter_w = max(0, xB - xA)
+    inter_h = max(0, yB - yA)
+    inter_area = inter_w * inter_h
+    areaA = (boxA[2]-boxA[0])*(boxA[3]-boxA[1])
+    areaB = (boxB[2]-boxB[0])*(boxB[3]-boxB[1])
+    union_area = areaA + areaB - inter_area
+    return 0.0 if union_area == 0 else inter_area / union_area
 
-ultimo_dato_calibracion = None
-lock = threading.Lock()
+def nms(detections, iou_thres=0.5):
+    """Non-Maximum Suppression básico."""
+    if not detections:
+        return []
+    detections = sorted(detections, key=lambda d: d['confidence'], reverse=True)
+    final = []
+    while detections:
+        best = detections.pop(0)
+        final.append(best)
+        detections = [d for d in detections if iou(best['box'], d['box']) < iou_thres]
+    return final
 
-# ------------------------------------------------------------------------------
-#                   FUNCIONES PARA CSV Y LOG
-# ------------------------------------------------------------------------------
-def guardar_evento(evento, tipo, valor, valor_inicial, diferencia="", setpoint=""):
-    """
-    Guarda un evento en el CSV con la información dada.
-    """
-    if tipo == "Patron":
+def check_consensus(buffer_list, required_count=1):
+    """Devuelve la última lectura si las últimas 'required_count' lecturas son iguales."""
+    if len(buffer_list) < required_count:
+        return None
+    last_values = buffer_list[-required_count:]
+    if all(v == last_values[0] for v in last_values):
+        return last_values[-1]
+    return None
+
+def is_progressive_valid(medidor, new_str):
+    if not HISTORY[medidor]:
+        return True
+    try:
+        old_val = int(HISTORY[medidor][-1])
+        new_val = int(new_str)
+    except ValueError:
+        return False
+    # Permite saltos hasta 5 unidades (ajustado)
+    return abs(new_val - old_val) <= 5
+
+def is_adaptive_range_valid(medidor, new_str, window=15, k=2):
+    if not HISTORY[medidor]:
+        return True
+    try:
+        new_val = int(new_str)
+    except ValueError:
+        return False
+    recent = HISTORY[medidor][-window:]
+    if not recent:
+        return True
+    vals_int = []
+    for v in recent:
         try:
-            valor = round(float(valor), 3)
-            valor_inicial = round(float(valor_inicial), 3)
-            if diferencia != "":
-                diferencia = round(float(diferencia), 3)
-        except Exception as e:
-            logging.error(f"Error redondeando valores para Patron: {e}")
+            vals_int.append(int(v))
+        except ValueError:
+            pass
+    if not vals_int:
+        return True
+    media = statistics.mean(vals_int)
+    stdev = statistics.pstdev(vals_int)
+    if stdev == 0:
+        stdev = 1
+    rango_min = media - k * stdev
+    rango_max = media + k * stdev
+    return (rango_min <= new_val <= rango_max)
 
-    file_exists = os.path.isfile(CSV_FILE)
-    write_header = not file_exists or os.stat(CSV_FILE).st_size == 0
+def is_any_valid(medidor, new_str):
+    return is_progressive_valid(medidor, new_str) or is_adaptive_range_valid(medidor, new_str, window=15, k=3)
 
-    with open(CSV_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        if write_header:
-            writer.writerow(CSV_HEADER)
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        writer.writerow([evento, tipo, valor, valor_inicial, diferencia, setpoint, timestamp])
+###############################################################################
+#                               CARGA DE MODELOS                               #
+###############################################################################
+DISPLAY_MODELS_DIR = 'modelos_display'
+NUMERIC_MODELS_DIR = 'modelos_numericos'
 
-# ------------------------------------------------------------------------------
-#                   NUEVA FUNCIÓN: Escribir bandera en DB250 para repeticiones
-# ------------------------------------------------------------------------------
+# Modelos principales para medidores:
+display_model = load_local_model(os.path.join(DISPLAY_MODELS_DIR, 'Display.pt'))     # Para Medidor_1, Medidor_2, Medidor_3
 
-# --- NUEVO --- Configuración de la DB de banderas para repeticiones (DB250)
-# Se utilizarán los bits: 1 para rep1, 2 para rep2, …, 10 para rep10.
-BANDERAS_DB = 3
-BANDERAS_BYTE73 = 73  # Se usa el byte 0
+# Submodelos numéricos para medidores:
+analogico_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'Analogico.pt'))      # Medidor_1
+negro_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'ult.pt'))                # Medidor_1, Medidor_2, Medidor_3
+metal_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'metal.pt'))              # Medidor_2
 
-BANDERAS_BYTE74 = 74
+MEDIDOR_TO_MODEL = {
+    'Medidor_1': analogico_model,
+    'Medidor_2': negro_model,
+    'Medidor_3': metal_model
+}
 
-def escribir_bandera_db73(rep: int, valor: bool):
-    try:
-        # Leer el byte actual del PLC
-        data = cliente_plc.db_read(BANDERAS_DB, BANDERAS_BYTE73, 1)
-        # Actualizar únicamente el bit deseado
-        set_bool(data, 0, rep, valor)
-        # Escribir el byte modificado de vuelta al PLC
-        cliente_plc.db_write(BANDERAS_DB, BANDERAS_BYTE73, data)
-        logging.info(f"Escrito bandera en DB{BANDERAS_DB}.DBX{BANDERAS_BYTE74}.{rep} a {valor}")
-    except Exception as e:
-        logging.error(f"Error escribiendo bandera en DB{BANDERAS_DB}.DBX{BANDERAS_BYTE74}.{rep}: {e}")
+# Para Honeywell y Display Digital:
+display_honeywell_model = load_local_model(os.path.join(DISPLAY_MODELS_DIR, 'display_honeywell.pt'))
+numero_honeywell_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'numero_honeywell.pt'))
+subdisplay_honeywell_model = load_local_model(os.path.join(DISPLAY_MODELS_DIR, 'subdisplay_honeywell.pt'))
 
+display_digital_model = load_local_model(os.path.join(DISPLAY_MODELS_DIR, 'Display_digital.pt'))
+numero_digital_model = load_local_model(os.path.join(NUMERIC_MODELS_DIR, 'numero_digital.pt'))
 
-def escribir_bandera_db74(rep: int, valor: bool):
-    try:
-        # Leer el byte actual del PLC
-        data = cliente_plc.db_read(BANDERAS_DB, BANDERAS_BYTE74, 1)
-        # Actualizar únicamente el bit deseado
-        set_bool(data, 0, rep, valor)
-        # Escribir el byte modificado de vuelta al PLC
-        cliente_plc.db_write(BANDERAS_DB, BANDERAS_BYTE74, data)
-        logging.info(f"Escrito bandera en DB{BANDERAS_DB}.DBX{BANDERAS_BYTE74}.{rep} a {valor}")
-    except Exception as e:
-        logging.error(f"Error escribiendo bandera en DB{BANDERAS_DB}.DBX{BANDERAS_BYTE74}.{rep}: {e}")
+###############################################################################
+#                             APLICACIÓN FLASK                                #
+###############################################################################
+app = Flask(__name__)
+CORS(app)
 
+###############################################################################
+#                        HILO DE CAPTURA DE FRAMES                          #
+###############################################################################
+class FrameCaptureThread(threading.Thread):
+    def __init__(self, camera_index=CAMERA_INDEX):
+        super().__init__(daemon=True)
+        self.cap = cv2.VideoCapture(camera_index)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        self.frame = None
+        self.running = True
+        self.lock = threading.Lock()
+    def run(self):
+        while self.running:
+            success, frame = self.cap.read()
+            if not success:
+                logging.error("Error al capturar el frame de la cámara.")
+                continue
+            with self.lock:
+                self.frame = frame
+            time.sleep(0.01)
+    def get_frame(self):
+        with self.lock:
+            return self.frame.copy() if self.frame is not None else None
+    def stop(self):
+        self.running = False
+        self.cap.release()
 
-# ------------------------------------------------------------------------------
-#                   FUNCIONES PARA CONEXIÓN Y LECTURA DE PLC
-# ------------------------------------------------------------------------------
-def conectar_plc():
-    global conectado_plc
-    try:
-        cliente_plc.connect(PLC_IP, PLC_RACK, PLC_SLOT)
-        if cliente_plc.get_connected():
-            logging.info(f"Conectado al PLC en {PLC_IP}, rack={PLC_RACK}, slot={PLC_SLOT}")
-            conectado_plc = True
-    except Exception as e:
-        logging.error(f"Error conectando al PLC: {e}")
-        conectado_plc = False
+frame_capture_thread = FrameCaptureThread()
+frame_capture_thread.start()
 
-def leer_bandera_test():
-    if not conectado_plc:
-        return False
-    try:
-        data = cliente_plc.db_read(FLAG_DB, FLAG_OFFSET, 3)
-        return get_bool(data, 0, 3)
-    except Exception as e:
-        logging.error(f"Error leyendo bandera test: {e}")
-        return False
+def stop_frame_capture():
+    frame_capture_thread.stop()
+    print("Hilo de captura de frames detenido.")
 
-def escribir_bandera_test(valor: bool):
-    if not conectado_plc:
-        return
-    try:
-        data = bytearray(1)
-        set_bool(data, 0, 0, valor)
-        cliente_plc.db_write(FLAG_DB, FLAG_OFFSET, data)
-    except Exception as e:
-        logging.error(f"Error escribiendo bandera test: {e}")
+atexit.register(stop_frame_capture)
 
-def leer_dbd_real(db_num, start):
+###############################################################################
+#              HILO DE DETECCIÓN CONTINUA (MULTI-RAMA)                      #
+###############################################################################
+class DetectionLoopThread(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.running = True
+        self.latest_processed_frame = None
+    def run(self):
+        global DETECT_ACTIVE, LAST_VALID_FRAME
+        while self.running:
+            frame = frame_capture_thread.get_frame()
+            if frame is None:
+                time.sleep(0.01)
+                continue
+            if DETECT_ACTIVE:
+                processed = detect_display(frame)
+                combined = combine_rois(processed)
+                with LOCK:
+                    LAST_VALID_FRAME = combined.copy()
+                self.latest_processed_frame = combined
+            else:
+                self.latest_processed_frame = frame
+            time.sleep(0.01)
+    def get_processed_frame(self):
+        if self.latest_processed_frame is not None:
+            return self.latest_processed_frame.copy()
+        return None
+    def stop(self):
+        self.running = False
+
+detection_loop_thread = DetectionLoopThread()
+detection_loop_thread.start()
+
+###############################################################################
+#              FUNCIÓN DE DETECCIÓN: PROCESAR TODAS LAS RAMAS                #
+###############################################################################
+def detect_display(frame):
     """
-    Lee 4 bytes e interpreta el valor como REAL (IEEE754 big-endian).
+    Procesa las ramas:
+      - Medidores (Medidor_1, Medidor_2 y Medidor_3)
+      - Display Digital
+      - Honeywell  
+    Retorna una lista de ROIs para visualización.
     """
-    if not conectado_plc:
-        return 0.0
-    try:
-        data = cliente_plc.db_read(db_num, start, 4)
-        return struct.unpack('>f', data)[0]
-    except Exception as e:
-        logging.error(f"Error leyendo DB{db_num}.DBD{start} como REAL: {e}")
-        return 0.0
+    rois_medidores = []
+    rois_digital = []
+    rois_honeywell = []
+    ih, iw, _ = frame.shape
 
-def leer_dbd_int(db_num, start):
-    """
-    Lee 4 bytes e interpreta el valor como entero (32-bit signed, big-endian).
-    """
-    if not conectado_plc:
-        return 0
-    try:
-        data = cliente_plc.db_read(db_num, start, 2)
-        return struct.unpack('>h', data)[0]
-    except Exception as e:
-        logging.error(f"Error leyendo DB{db_num}.DBD{start} como entero: {e}")
-        return 0
+    # Primero: Verificar la presencia de "rf4" en el frame (usando Display_4.pt)
+    # Nota: Se conserva la verificación para Honeywell, en caso de no haber detecciones en medidores ni digital.
+    rf4_present = False
+    results_rf4 = display_honeywell_model(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    labels_rf4 = results_rf4.xyxyn[0][:, -1].cpu().numpy()
+    for label in labels_rf4:
+        if display_honeywell_model.names[int(label)] == 'rf4':
+            rf4_present = True
+            break
 
-# ------------------------------------------------------------------------------
-#   FUNCIÓN ESCRITURA GENÉRICA: escribe valor según tag (MRx, MPx) en DB
-# ------------------------------------------------------------------------------
-def escribir_valor_plc(tag, valor, cliente_plc):
-    """
-    Dependiendo del tag (p.ej. "MR2I", "MP1F"), se busca en los diccionarios
-    CAMERA_DB_MAP o PATTERN_DB_MAP la configuración {db, offset, type} y se hace la escritura.
-    """
-    config = None
-    if tag in CAMERA_DB_MAP:
-        config = CAMERA_DB_MAP[tag]
-    elif tag in PATTERN_DB_MAP:
-        config = PATTERN_DB_MAP[tag]
-    else:
-        raise ValueError(f"Tag '{tag}' no encontrado en la configuración de DB.")
-
-    db = config["db"]
-    offset = config["offset"]
-    tipo = config["type"]
-
-    try:
-        if tipo == "int":
-            data = bytearray(struct.pack('>i', int(valor)))
-        elif tipo == "float":
-            data = bytearray(struct.pack('>f', float(valor)))
-        else:
-            raise ValueError(f"Tipo de dato '{tipo}' no soportado.")
-        cliente_plc.db_write(db, offset, data)
-        logging.info(f"Escrito valor={valor} en DB{db}.DBD{offset} (tag={tag}, tipo={tipo})")
-    except Exception as e:
-        logging.error(f"Error escribiendo valor en PLC para tag={tag}, valor={valor}: {e}")
-
-# ------------------------------------------------------------------------------
-#                   ENDPOINT FLASK PARA RECIBIR DATOS DE CÁMARA
-# ------------------------------------------------------------------------------
-@app.route('/calibration', methods=['POST'])
-def calibration():
-    global ultimo_dato_calibracion
-    data = request.get_json()
-    if not data or 'dato' not in data:
-        return jsonify({'error': 'No se proporcionó el dato'}), 400
-    with lock:
-        ultimo_dato_calibracion = data['dato']
-    logging.info("Valor de cámara actualizado: %s", data['dato'])
-    return jsonify({'status': 'Dato actualizado', 'dato': data['dato']}), 200
-
-def obtener_num_repeticiones():
-    try:
-        # Crear una nueva instancia de cliente para esta lectura
-        cliente_temp = snap7.client.Client()
-        cliente_temp.connect(PLC_IP, PLC_RACK, PLC_SLOT)
-        # Leer 2 bytes desde DB3 en offset 26 (DB3.DBW26)
-        data = cliente_temp.db_read(3, 26, 2)
-        # Desempaquetar como entero de 16 bits (big-endian)
-        num = struct.unpack('>h', data)[0]
-        cliente_temp.disconnect()
-        logging.info(f"NUM_REPETICIONES obtenido desde DB3.DBW26: {num}")
-        return num
-    except Exception as e:
-        logging.error(f"Error leyendo NUM_REPETICIONES desde DB3.DBW26: {e}")
-        return 10  # Valor por defecto en caso de error
-    
-
-
-
-
-
-# ------------------------------------------------------------------------------
-#                   HILO PRINCIPAL DE PROCESAMIENTO (CALIBRACIÓN)
-# ------------------------------------------------------------------------------
-def procesamiento_dato():
-    global ultimo_dato_calibracion
-    while True:
-        if not conectado_plc:
-            conectar_plc()
-
-        bandera = leer_bandera_test()
-        if bandera:
-            NUM_REPETICIONES = obtener_num_repeticiones()
-            print('NUMERO DE REPETICIONES', obtener_num_repeticiones())
-            logging.info("La bandera está en TRUE, comenzamos la lógica de calibración para %s.", TEST)
-            
-            # Esperar a que llegue un valor nuevo para iniciar
-            with lock:
-                primer_valor = ultimo_dato_calibracion
-            while True:
-                with lock:
-                    nuevo_valor = ultimo_dato_calibracion
-                if nuevo_valor != primer_valor:
-                    valor_inicial_camara = nuevo_valor
-                    break
-                time.sleep(0.05)
-            logging.info("Inicia calibración con valor inicial de cámara: %s", valor_inicial_camara)
-
-            # Leer patrón y setpoint
-            v_patron_inicial = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-            setpoint = leer_dbd_int(SETPOINT_DB, SETPOINT_OFFSET)
-            logging.info("Patrón inicial=%s, Setpoint=%s", v_patron_inicial, setpoint)
-
-            # Repetición 1: se asume que la bandera (DB250.DBX0.1) ya viene en TRUE desde el PLC.
-            guardar_evento("MR1I", "Camara", valor_inicial_camara, valor_inicial_camara, "", setpoint)
-            guardar_evento("MP1I", "Patron", v_patron_inicial, v_patron_inicial, "", setpoint)
-            
-            escribir_bandera_db73(3, True)
-
-
-            escribir_valor_plc("MR1I", valor_inicial_camara, cliente_plc)
-            escribir_valor_plc("MP1I", v_patron_inicial, cliente_plc)
-            
-            # Generar thresholds para las repeticiones
-            thresholds = []
-            thresholds.append(valor_inicial_camara + setpoint)  # Repetición 1
-            for i in range(1, 10):  # Repeticiones 2 a 10
-                thresholds.append(thresholds[i-1] + GAP)
-
-            # Arrays para almacenar valores de inicio y final de cámara y patrón
-            r_inicial_camara = [None] * 10
-            r_inicial_patron = [None] * 10
-            r_final_camara = [None] * 10
-            r_final_patron = [None] * 10
-
-            rep_inicio_registrado = [False] * 10
-            rep_final_registrado = [False] * 10
-
-            # Repetición 1: ya iniciada; su bandera permanece TRUE hasta que se finalice.
-            r_inicial_camara[0] = valor_inicial_camara
-            r_inicial_patron[0] = v_patron_inicial
-            rep_inicio_registrado[0] = True
-
-            while True:
-                with lock:
-                    v_camara = ultimo_dato_calibracion
-                if v_camara is None:
-                    time.sleep(0.1)
+    # --- Rama Medidores (Medidor_1, Medidor_2, Medidor_3) ---
+    results_display = display_model(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    labels_display = results_display.xyxyn[0][:, -1].cpu().numpy()
+    boxes_display  = results_display.xyxyn[0][:, :-1].cpu().numpy()
+    for label, box in zip(labels_display, boxes_display):
+        class_name = display_model.names[int(label)]
+        if class_name not in ['Medidor_1', 'Medidor_2', 'Medidor_3']:
+            continue
+        x1, y1, x2, y2, conf = box
+        x1, y1 = int(x1 * iw), int(y1 * ih)
+        x2, y2 = int(x2 * iw), int(y2 * ih)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        roi = frame[y1:y2, x1:x2].copy()
+        if roi.size == 0:
+            continue
+        submodel = MEDIDOR_TO_MODEL.get(class_name)
+        if submodel:
+            sub_results = submodel(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+            # Recopilamos todas las detecciones que superen el umbral, incluyendo la clase "10"
+            detections_all = []
+            for d in sub_results.xyxy[0]:
+                xa1, ya1, xa2, yb2, conf_sub, cls_sub = d
+                if conf_sub < CONFIDENCE_THRESHOLD:
                     continue
+                cls_name = submodel.names[int(cls_sub)]
+                detections_all.append({
+                    'class': cls_name,
+                    'box': [int(xa1), int(ya1), int(xa2), int(yb2)],
+                    'confidence': float(conf_sub),
+                    'x1': int(xa1)
+                })
+            # Ordenar las detecciones de izquierda a derecha
+            detections_all_sorted = sorted(detections_all, key=lambda det: det['x1'])
+            # La validación con clase "10" solo se aplica si la detección más a la derecha es "10"
+            if detections_all_sorted and detections_all_sorted[-1]['class'] == '10':
+                has_class_10 = True
+            else:
+                has_class_10 = False
+            # Filtrar las detecciones para procesar el número (excluyendo la clase "10")
+            dets = [det for det in detections_all_sorted if det['class'] != '10']
+            dets_sorted = dets  # ya ordenados por x1
+            new_digits = ''.join(det['class'] for det in dets_sorted)
+            if has_class_10:
+                cv2.rectangle(roi, (0, 0), (roi.shape[1]-1, roi.shape[0]-1), (255, 0, 0), 2)
+            else:
+                if is_any_valid(class_name, new_digits):
+                    DETECTION_BUFFER.setdefault(class_name, [])
+                    DETECTION_BUFFER[class_name].append(new_digits)
+                    if len(DETECTION_BUFFER[class_name]) > MAX_BUFFER_SIZE:
+                        DETECTION_BUFFER[class_name].pop(0)
+                    confirmed_value = check_consensus(DETECTION_BUFFER[class_name], required_count=CONSENSUS_COUNT)
+                    if confirmed_value:
+                        try:
+                            dato_final = int(confirmed_value)
+                        except ValueError:
+                            print(f"[ERROR] Valor no válido: {confirmed_value}")
+                            continue
+                        if LAST_CONFIRMED_VALUE["value"] != dato_final:
+                            HISTORY.setdefault(class_name, []).append(dato_final)
+                            print(f"[CONSOLE] {class_name} => {dato_final}")
+                            with LOCK:
+                                LAST_CONFIRMED_VALUE["medidor"] = class_name
+                                LAST_CONFIRMED_VALUE["value"] = dato_final
+                                DETECTION_BUFFER[class_name].clear()
+                            try:
+                                payload = {"dato": dato_final}
+                                respuesta = requests.post("http://localhost:5001/calibration", json=payload, timeout=2)
+                                if respuesta.ok:
+                                    print(f"[DEBUG] Valor enviado al servicio de calibración: {dato_final}")
+                                else:
+                                    print(f"[ERROR] Error en envío, código: {respuesta.status_code}")
+                            except Exception as e:
+                                print(f"[ERROR] Excepción al enviar dato: {e}")
+            cv2.putText(roi, class_name, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.rectangle(roi, (0, 0), (roi.shape[1]-1, roi.shape[0]-1), (0, 255, 0), 2)
+            rois_medidores.append(roi)
 
-                # --- Repetición 1: Finalización ---
-                if NUM_REPETICIONES >= 1:
-                    if (not rep_final_registrado[0]) and (v_camara >= thresholds[0]):
-                        r_final_camara[0] = v_camara
-                        r_final_patron[0] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                        dif_cam = r_final_camara[0] - r_inicial_camara[0]
-                        dif_pat = r_final_patron[0] - r_inicial_patron[0]
+    # --- Rama Display Digital ---
+    results_digital = display_digital_model(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    labels_digital = results_digital.xyxyn[0][:, -1].cpu().numpy()
+    boxes_digital  = results_digital.xyxyn[0][:, :-1].cpu().numpy()
+    for label, box in zip(labels_digital, boxes_digital):
+        class_name = display_digital_model.names[int(label)]
+        if class_name != 'display_digital':
+            continue
+        x1, y1, x2, y2, conf = box
+        if conf < 0.7:
+            continue
+        x1, y1 = int(x1 * iw), int(y1 * ih)
+        x2, y2 = int(x2 * iw), int(y2 * ih)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        roi_digital = frame[y1:y2, x1:x2].copy()
+        if roi_digital.size == 0:
+            continue
+        results_num_digital = numero_digital_model(cv2.cvtColor(roi_digital, cv2.COLOR_BGR2RGB))
+        dets = []
+        for d in results_num_digital.xyxy[0]:
+            xa1, ya1, xa2, yb2, conf_sub, cls_sub = d
+            if conf_sub >= CONFIDENCE_THRESHOLD:
+                cls_name_digit = numero_digital_model.names[int(cls_sub)]
+                dets.append({
+                    'class': cls_name_digit,
+                    'box': [int(xa1), int(ya1), int(xa2), int(yb2)],
+                    'confidence': float(conf_sub)
+                })
+        dets = nms(dets, iou_thres=IOU_THRESHOLD)
+        dets_sorted = sorted(dets, key=lambda dd: dd['box'][0])
+        new_digits = ''.join(dd['class'] for dd in dets_sorted)
+        cv2.putText(roi_digital, new_digits, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.rectangle(roi_digital, (0, 0), (roi_digital.shape[1]-1, roi_digital.shape[0]-1), (0, 255, 0), 2)
+        rois_digital.append(roi_digital)
+        if is_any_valid('Display_digital', new_digits):
+            DETECTION_BUFFER.setdefault('Display_digital', [])
+            DETECTION_BUFFER['Display_digital'].append(new_digits)
+            if len(DETECTION_BUFFER['Display_digital']) > MAX_BUFFER_SIZE:
+                DETECTION_BUFFER['Display_digital'].pop(0)
+            confirmed_value = check_consensus(DETECTION_BUFFER['Display_digital'], required_count=CONSENSUS_COUNT)
+            if confirmed_value:
+                try:
+                    dato_final = int(confirmed_value)
+                except ValueError:
+                    print(f"[ERROR] Valor no válido en Display_digital: {confirmed_value}")
+                    continue
+                if len(confirmed_value) == 8:
+                    if LAST_CONFIRMED_VALUE["value"] != dato_final:
+                        HISTORY.setdefault('Display_digital', []).append(dato_final)
+                        print(f"[CONSOLE] Display_digital => {dato_final}")
+                        with LOCK:
+                            LAST_CONFIRMED_VALUE["medidor"] = 'Display_digital'
+                            LAST_CONFIRMED_VALUE["value"] = dato_final
+                            DETECTION_BUFFER['Display_digital'].clear()
+                        try:
+                            payload = {"dato": dato_final}
+                            respuesta = requests.post("http://localhost:5001/calibration", json=payload, timeout=2)
+                            if respuesta.ok:
+                                print(f"[DEBUG] Display_digital: dato enviado: {dato_final}")
+                            else:
+                                print(f"[ERROR] Display_digital: error en envío, código: {respuesta.status_code}")
+                        except Exception as e:
+                            print(f"[ERROR] Display_digital: excepción al enviar dato: {e}")
+                else:
+                    print("[DEBUG] Valor en Display_digital no tiene 8 dígitos; se conserva el valor anterior.")
 
-                        guardar_evento("MR1F", "Camara", r_final_camara[0], r_inicial_camara[0], dif_cam)
-                        guardar_evento("MP1F", "Patron", r_final_patron[0], r_inicial_patron[0], dif_pat)
-                        escribir_valor_plc("MR1F", r_final_camara[0], cliente_plc)
-                        escribir_valor_plc("MP1F", r_final_patron[0], cliente_plc)
-                        escribir_bandera_db73(3, False) 
-                        rep_final_registrado[0] = True
-                         # Solo se envía FALSE al finalizar rep1
-                        logging.info("Repetición 1 final: MR1F=%.2f, MP1F=%.2f | difCam=%.2f, difPat=%.2f",
-                                     r_final_camara[0], r_final_patron[0], dif_cam, dif_pat)
+    # --- Rama Honeywell ---
+    if not rois_medidores and not rois_digital:
+        results_honeywell = display_honeywell_model(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        labels_honeywell = results_honeywell.xyxyn[0][:, -1].cpu().numpy()
+        boxes_honeywell  = results_honeywell.xyxyn[0][:, :-1].cpu().numpy()
+        for label, box in zip(labels_honeywell, boxes_honeywell):
+            class_name = display_honeywell_model.names[int(label)]
+            if class_name != 'honeywell':
+                continue
+            x1, y1, x2, y2, conf = box
+            x1, y1 = int(x1 * iw), int(y1 * ih)
+            x2, y2 = int(x2 * iw), int(y2 * ih)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            roi_honeywell = frame[y1:y2, x1:x2].copy()
+            if roi_honeywell.size == 0:
+                continue
+            roi_honeywell_copia = roi_honeywell.copy()
+            sub_results_honeywell = subdisplay_honeywell_model(cv2.cvtColor(roi_honeywell, cv2.COLOR_BGR2RGB))
+            dets_subdisplay = []
+            has_class_10_honeywell = False
+            for d_sub in sub_results_honeywell.xyxy[0]:
+                xs1, ys1, xs2, ys2, conf_sub, cls_sub = d_sub
+                cls_name_sub = subdisplay_honeywell_model.names[int(cls_sub)]
+                if cls_name_sub == '10':
+                    has_class_10_honeywell = True
+                elif conf_sub >= CONFIDENCE_THRESHOLD:
+                    dets_subdisplay.append({
+                        'class': cls_name_sub,
+                        'box': [int(xs1), int(ys1), int(xs2), int(ys2)],
+                        'confidence': float(conf_sub)
+                    })
+            dets_subdisplay = nms(dets_subdisplay, iou_thres=IOU_THRESHOLD)
+            dets_sorted_subdisplay = sorted(dets_subdisplay, key=lambda dd: dd['box'][0])
+            for det in dets_sorted_subdisplay:
+                x_sub1, y_sub1, x_sub2, y_sub2 = det['box']
+                cv2.rectangle(roi_honeywell_copia, (x_sub1, y_sub1), (x_sub2, y_sub2), (255, 255, 0), 2)
+                cv2.putText(roi_honeywell_copia, det['class'], (x_sub1, y_sub1-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
+            numero_honeywell_results = numero_honeywell_model(cv2.cvtColor(roi_honeywell, cv2.COLOR_BGR2RGB))
+            dets_numero_honeywell = []
+            for d_num in numero_honeywell_results.xyxy[0]:
+                xn1, yn1, xn2, yn2, conf_num, cls_num = d_num
+                if conf_num >= CONFIDENCE_THRESHOLD:
+                    cls_name_num = numero_honeywell_model.names[int(cls_num)]
+                    dets_numero_honeywell.append({
+                        'class': cls_name_num,
+                        'box': [int(xn1), int(yn1), int(xn2), int(yn2)],
+                        'confidence': float(conf_num)
+                    })
+            dets_numero_honeywell = nms(dets_numero_honeywell, iou_thres=IOU_THRESHOLD)
+            dets_sorted_numero_honeywell = sorted(dets_numero_honeywell, key=lambda dd: dd['box'][0])
+            filtered_numbers = []
+            for det_num in dets_sorted_numero_honeywell:
+                num_box = det_num['box']
+                num_center = ((num_box[0] + num_box[2]) / 2, (num_box[1] + num_box[3]) / 2)
+                inside = False
+                for det_sub in dets_sorted_subdisplay:
+                    sub_box = det_sub['box']
+                    if (sub_box[0] <= num_center[0] <= sub_box[2]) and (sub_box[1] <= num_center[1] <= sub_box[3]):
+                        inside = True
+                        break
+                if inside:
+                    filtered_numbers.append(det_num)
+            detected_numbers = [det['class'] for det in filtered_numbers]
+            if detected_numbers:
+                numero_detectado = ''.join(detected_numbers)
+                if numero_detectado:
+                    if numero_detectado[0] == '0':
+                        pos = initial_dot_pos
+                    else:
+                        pos = initial_dot_pos + 1
+                    if len(numero_detectado) >= pos:
+                        numero_formateado = numero_detectado[:pos] + '.' + numero_detectado[pos:]
+                    else:
+                        numero_formateado = numero_detectado + '.'
+                    print(f"[DEBUG] El punto decimal se insertó después del dígito: {pos}")
+                    print(f"[DEBUG] Número detectado (con punto): {numero_formateado}")
+                else:
+                    numero_formateado = numero_detectado
+                parts = numero_formateado.split('.')
+                if len(parts) >= 2 and len(parts[1]) >= 3:
+                    right_part = parts[1][:3]
+                    try:
+                        dato_detectado = int(right_part)
+                    except ValueError:
+                        print("[ERROR] No se pudo convertir la parte derecha a entero.")
+                        dato_detectado = 0
+                    UMBRAL_CAMBIO = 10
+                    last_val = LAST_CONFIRMED_VALUE["value"] if LAST_CONFIRMED_VALUE["value"] is not None else dato_detectado
+                    if abs(dato_detectado - last_val) > UMBRAL_CAMBIO:
+                        print(f"[DEBUG] Cambio abrupto detectado ({dato_detectado} vs {last_val}). Se conserva el valor anterior.")
+                    else:
+                        if dato_detectado != last_val:
+                            print(f"[DEBUG] honeywell => {dato_detectado}")
+                            with LOCK:
+                                LAST_CONFIRMED_VALUE["medidor"] = 'honeywell'
+                                LAST_CONFIRMED_VALUE["value"] = dato_detectado
+                            try:
+                                payload = {"dato": dato_detectado}
+                                respuesta = requests.post("http://localhost:5001/calibration", json=payload, timeout=2)
+                                if respuesta.ok:
+                                    print(f"[DEBUG] honeywell: dato enviado: {dato_detectado}")
+                                else:
+                                    print(f"[ERROR] honeywell: error en envío, código: {respuesta.status_code}")
+                            except Exception as e:
+                                print(f"[ERROR] honeywell: excepción al enviar dato: {e}")
+                else:
+                    print("[DEBUG] No se detectaron 3 dígitos a la derecha del punto en honeywell, se conserva el valor anterior.")
+            cv2.putText(roi_honeywell_copia, 'honeywell', (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.rectangle(roi_honeywell_copia, (0, 0), (roi_honeywell_copia.shape[1]-1, roi_honeywell_copia.shape[0]-1), (0, 255, 0), 2)
+            rois_honeywell.append(roi_honeywell_copia)
 
-                # --- Repetición 2: Inicio y Final ---
-                if NUM_REPETICIONES >= 2:
-                    if (r_inicial_camara[0] is not None) and (not rep_inicio_registrado[1]):
-                        if v_camara >= (r_inicial_camara[0] + GAP):
-                            r_inicial_camara[1] = v_camara
-                            r_inicial_patron[1] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                            guardar_evento("MR2I", "Camara", r_inicial_camara[1], r_inicial_camara[1])
-                            guardar_evento("MP2I", "Patron", r_inicial_patron[1], r_inicial_patron[1])
-                            escribir_valor_plc("MR2I", r_inicial_camara[1], cliente_plc)
-                            escribir_valor_plc("MP2I", r_inicial_patron[1], cliente_plc)
-                            rep_inicio_registrado[1] = True
-                            escribir_bandera_db73(4, True)
-                            logging.info("Repetición 2 inicio: MR2I=%.2f, MP2I=%.2f",
-                                         r_inicial_camara[1], r_inicial_patron[1])
-                    if rep_inicio_registrado[1] and (not rep_final_registrado[1]) and (v_camara >= thresholds[1]):
-                        r_final_camara[1] = v_camara
-                        r_final_patron[1] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                        dif_cam = r_final_camara[1] - r_inicial_camara[1]
-                        dif_pat = r_final_patron[1] - r_inicial_patron[1]
-                        guardar_evento("MR2F", "Camara", r_final_camara[1], r_inicial_camara[1], dif_cam)
-                        guardar_evento("MP2F", "Patron", r_final_patron[1], r_inicial_patron[1], dif_pat)
-                        escribir_valor_plc("MR2F", r_final_camara[1], cliente_plc)
-                        escribir_valor_plc("MP2F", r_final_patron[1], cliente_plc)
-                        rep_final_registrado[1] = True
-                        escribir_bandera_db73(4, False)  # Enviar FALSE solo al finalizar rep2
-                        logging.info("Repetición 2 final: MR2F=%.2f, MP2F=%.2f | difCam=%.2f, difPat=%.2f",
-                                     r_final_camara[1], r_final_patron[1], dif_cam, dif_pat)
+    if rois_medidores or rois_digital:
+        return rois_medidores + rois_digital
+    else:
+        return rois_honeywell
 
-                # --- Repetición 3: Inicio y Final ---
-                if NUM_REPETICIONES >= 3:
-                    if (r_inicial_camara[1] is not None) and (not rep_inicio_registrado[2]):
-                        if v_camara >= (r_inicial_camara[1] + GAP):
-                            r_inicial_camara[2] = v_camara
-                            r_inicial_patron[2] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                            guardar_evento("MR3I", "Camara", r_inicial_camara[2], r_inicial_camara[2])
-                            guardar_evento("MP3I", "Patron", r_inicial_patron[2], r_inicial_patron[2])
-                            escribir_valor_plc("MR3I", r_inicial_camara[2], cliente_plc)
-                            escribir_valor_plc("MP3I", r_inicial_patron[2], cliente_plc)
-                            rep_inicio_registrado[2] = True
-                            escribir_bandera_db73(5, True)
-                            logging.info("Repetición 3 inicio: MR3I=%.2f, MP3I=%.2f",
-                                         r_inicial_camara[2], r_inicial_patron[2])
-                    if rep_inicio_registrado[2] and (not rep_final_registrado[2]) and (v_camara >= thresholds[2]):
-                        r_final_camara[2] = v_camara
-                        r_final_patron[2] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                        dif_cam = r_final_camara[2] - r_inicial_camara[2]
-                        dif_pat = r_final_patron[2] - r_inicial_patron[2]
-                        guardar_evento("MR3F", "Camara", r_final_camara[2], r_inicial_camara[2], dif_cam)
-                        guardar_evento("MP3F", "Patron", r_final_patron[2], r_inicial_patron[2], dif_pat)
-                        escribir_valor_plc("MR3F", r_final_camara[2], cliente_plc)
-                        escribir_valor_plc("MP3F", r_final_patron[2], cliente_plc)
-                        rep_final_registrado[2] = True
-                        escribir_bandera_db73(5, False)
-                        logging.info("Repetición 3 final: MR3F=%.2f, MP3F=%.2f | difCam=%.2f, difPat=%.2f",
-                                     r_final_camara[2], r_final_patron[2], dif_cam, dif_pat)
+def combine_rois(rois, max_rois_per_row=4, padding=10):
+    """Combina las ROIs en una sola imagen para visualización."""
+    if not rois:
+        blank = np.zeros((300, 400, 3), dtype=np.uint8)
+        cv2.putText(blank, 'No detecciones', (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        return blank
+    rois = rois[: max_rois_per_row * 3]
+    num_rois = len(rois)
+    num_cols = min(num_rois, max_rois_per_row)
+    num_rows = (num_rois + max_rois_per_row - 1) // max_rois_per_row
+    col_widths = [0] * num_cols
+    for i, roi in enumerate(rois):
+        c = i % max_rois_per_row
+        col_widths[c] = max(col_widths[c], roi.shape[1])
+    row_heights = [0] * num_rows
+    for i, roi in enumerate(rois):
+        r = i // max_rois_per_row
+        row_heights[r] = max(row_heights[r], roi.shape[0])
+    total_w = sum(col_widths) + padding * (num_cols + 1)
+    total_h = sum(row_heights) + padding * (num_rows + 1)
+    combined = np.zeros((total_h, total_w, 3), dtype=np.uint8)
+    y_off = padding
+    idx_roi = 0
+    for r in range(num_rows):
+        x_off = padding
+        for c in range(num_cols):
+            if idx_roi >= num_rois:
+                break
+            roi = rois[idx_roi]
+            combined[y_off:y_off+roi.shape[0], x_off:x_off+roi.shape[1]] = roi
+            x_off += col_widths[c] + padding
+            idx_roi += 1
+        y_off += row_heights[r] + padding
+    return combined
 
-                # --- Repetición 4: Inicio y Final ---
-                if NUM_REPETICIONES >= 4:
-                    if (r_inicial_camara[2] is not None) and (not rep_inicio_registrado[3]):
-                        if v_camara >= (r_inicial_camara[2] + GAP):
-                            r_inicial_camara[3] = v_camara
-                            r_inicial_patron[3] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                            guardar_evento("MR4I", "Camara", r_inicial_camara[3], r_inicial_camara[3])
-                            guardar_evento("MP4I", "Patron", r_inicial_patron[3], r_inicial_patron[3])
-                            escribir_valor_plc("MR4I", r_inicial_camara[3], cliente_plc)
-                            escribir_valor_plc("MP4I", r_inicial_patron[3], cliente_plc)
-                            rep_inicio_registrado[3] = True
-                            escribir_bandera_db73(6, True)
-                            logging.info("Repetición 4 inicio: MR4I=%.2f, MP4I=%.2f",
-                                         r_inicial_camara[3], r_inicial_patron[3])
-                    if rep_inicio_registrado[3] and (not rep_final_registrado[3]) and (v_camara >= thresholds[3]):
-                        r_final_camara[3] = v_camara
-                        r_final_patron[3] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                        dif_cam = r_final_camara[3] - r_inicial_camara[3]
-                        dif_pat = r_final_patron[3] - r_inicial_patron[3]
-                        guardar_evento("MR4F", "Camara", r_final_camara[3], r_inicial_camara[3], dif_cam)
-                        guardar_evento("MP4F", "Patron", r_final_patron[3], r_inicial_patron[3], dif_pat)
-                        escribir_valor_plc("MR4F", r_final_camara[3], cliente_plc)
-                        escribir_valor_plc("MP4F", r_final_patron[3], cliente_plc)
-                        rep_final_registrado[3] = True
-                        escribir_bandera_db73(6, False)
-                        logging.info("Repetición 4 final: MR4F=%.2f, MP4F=%.2f | difCam=%.2f, difPat=%.2f",
-                                     r_final_camara[3], r_final_patron[3], dif_cam, dif_pat)
+###############################################################################
+#                             ENDPOINTS FLASK                                #
+###############################################################################
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-                # --- Repetición 5: Inicio y Final ---
-                if NUM_REPETICIONES >= 5:
-                    if (r_inicial_camara[3] is not None) and (not rep_inicio_registrado[4]):
-                        if v_camara >= (r_inicial_camara[3] + GAP):
-                            r_inicial_camara[4] = v_camara
-                            r_inicial_patron[4] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                            guardar_evento("MR5I", "Camara", r_inicial_camara[4], r_inicial_camara[4])
-                            guardar_evento("MP5I", "Patron", r_inicial_patron[4], r_inicial_patron[4])
-                            escribir_valor_plc("MR5I", r_inicial_camara[4], cliente_plc)
-                            escribir_valor_plc("MP5I", r_inicial_patron[4], cliente_plc)
-                            rep_inicio_registrado[4] = True
-                            escribir_bandera_db73(7, True)
-                            logging.info("Repetición 5 inicio: MR5I=%.2f, MP5I=%.2f",
-                                         r_inicial_camara[4], r_inicial_patron[4])
-                    if rep_inicio_registrado[4] and (not rep_final_registrado[4]) and (v_camara >= thresholds[4]):
-                        r_final_camara[4] = v_camara
-                        r_final_patron[4] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                        dif_cam = r_final_camara[4] - r_inicial_camara[4]
-                        dif_pat = r_final_patron[4] - r_inicial_patron[4]
-                        guardar_evento("MR5F", "Camara", r_final_camara[4], r_inicial_camara[4], dif_cam)
-                        guardar_evento("MP5F", "Patron", r_final_patron[4], r_inicial_patron[4], dif_pat)
-                        escribir_valor_plc("MR5F", r_final_camara[4], cliente_plc)
-                        escribir_valor_plc("MP5F", r_final_patron[4], cliente_plc)
-                        rep_final_registrado[4] = True
-                        escribir_bandera_db73(7, False)
-                        logging.info("Repetición 5 final: MR5F=%.2f, MP5F=%.2f | difCam=%.2f, difPat=%.2f",
-                                     r_final_camara[4], r_final_patron[4], dif_cam, dif_pat)
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames_from_detection_loop(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
-                # --- Repetición 6: Inicio y Final ---
-                if NUM_REPETICIONES >= 6:
-                    if (r_inicial_camara[4] is not None) and (not rep_inicio_registrado[5]):
-                        if v_camara >= (r_inicial_camara[4] + GAP):
-                            r_inicial_camara[5] = v_camara
-                            r_inicial_patron[5] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                            guardar_evento("MR6I", "Camara", r_inicial_camara[5], r_inicial_camara[5])
-                            guardar_evento("MP6I", "Patron", r_inicial_patron[5], r_inicial_patron[5])
-                            escribir_valor_plc("MR6I", r_inicial_camara[5], cliente_plc)
-                            escribir_valor_plc("MP6I", r_inicial_patron[5], cliente_plc)
-                            rep_inicio_registrado[5] = True
-                            escribir_bandera_db74(0, True)
-                            logging.info("Repetición 6 inicio: MR6I=%.2f, MP6I=%.2f",
-                                         r_inicial_camara[5], r_inicial_patron[5])
-                    if rep_inicio_registrado[5] and (not rep_final_registrado[5]) and (v_camara >= thresholds[5]):
-                        r_final_camara[5] = v_camara
-                        r_final_patron[5] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                        dif_cam = r_final_camara[5] - r_inicial_camara[5]
-                        dif_pat = r_final_patron[5] - r_inicial_patron[5]
-                        guardar_evento("MR6F", "Camara", r_final_camara[5], r_inicial_camara[5], dif_cam)
-                        guardar_evento("MP6F", "Patron", r_final_patron[5], r_inicial_patron[5], dif_pat)
-                        escribir_valor_plc("MR6F", r_final_camara[5], cliente_plc)
-                        escribir_valor_plc("MP6F", r_final_patron[5], cliente_plc)
-                        rep_final_registrado[5] = True
-                        escribir_bandera_db74(0, False)
-                        logging.info("Repetición 6 final: MR6F=%.2f, MP6F=%.2f | difCam=%.2f, difPat=%.2f",
-                                     r_final_camara[5], r_final_patron[5], dif_cam, dif_pat)
+def generate_frames_from_detection_loop():
+    while True:
+        frame = detection_loop_thread.get_processed_frame()
+        if frame is None:
+            time.sleep(0.01)
+            continue
+        ret, buffer = cv2.imencode('.jpg', frame)
+        frame_bytes = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
-                # --- Repetición 7: Inicio y Final ---
-                if NUM_REPETICIONES >= 7:
-                    if (r_inicial_camara[5] is not None) and (not rep_inicio_registrado[6]):
-                        if v_camara >= (r_inicial_camara[5] + GAP):
-                            r_inicial_camara[6] = v_camara
-                            r_inicial_patron[6] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                            guardar_evento("MR7I", "Camara", r_inicial_camara[6], r_inicial_camara[6])
-                            guardar_evento("MP7I", "Patron", r_inicial_patron[6], r_inicial_patron[6])
-                            escribir_valor_plc("MR7I", r_inicial_camara[6], cliente_plc)
-                            escribir_valor_plc("MP7I", r_inicial_patron[6], cliente_plc)
-                            rep_inicio_registrado[6] = True
-                            escribir_bandera_db74(1, True)
-                            logging.info("Repetición 7 inicio: MR7I=%.2f, MP7I=%.2f",
-                                         r_inicial_camara[6], r_inicial_patron[6])
-                    if rep_inicio_registrado[6] and (not rep_final_registrado[6]) and (v_camara >= thresholds[6]):
-                        r_final_camara[6] = v_camara
-                        r_final_patron[6] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                        dif_cam = r_final_camara[6] - r_inicial_camara[6]
-                        dif_pat = r_final_patron[6] - r_inicial_patron[6]
-                        guardar_evento("MR7F", "Camara", r_final_camara[6], r_inicial_camara[6], dif_cam)
-                        guardar_evento("MP7F", "Patron", r_final_patron[6], r_inicial_patron[6], dif_pat)
-                        escribir_valor_plc("MR7F", r_final_camara[6], cliente_plc)
-                        escribir_valor_plc("MP7F", r_final_patron[6], cliente_plc)
-                        rep_final_registrado[6] = True
-                        escribir_bandera_db74(1, False)
-                        logging.info("Repetición 7 final: MR7F=%.2f, MP7F=%.2f | difCam=%.2f, difPat=%.2f",
-                                     r_final_camara[6], r_final_patron[6], dif_cam, dif_pat)
+@app.route('/start', methods=['GET'])
+def start_detection():
+    global DETECT_ACTIVE
+    with LOCK:
+        DETECT_ACTIVE = True
+    print("[DEBUG] Detección iniciada.")
+    return jsonify({'status': 'detección iniciada'})
 
-                # --- Repetición 8: Inicio y Final ---
-                if NUM_REPETICIONES >= 8:
-                    if (r_inicial_camara[6] is not None) and (not rep_inicio_registrado[7]):
-                        if v_camara >= (r_inicial_camara[6] + GAP):
-                            r_inicial_camara[7] = v_camara
-                            r_inicial_patron[7] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                            guardar_evento("MR8I", "Camara", r_inicial_camara[7], r_inicial_camara[7])
-                            guardar_evento("MP8I", "Patron", r_inicial_patron[7], r_inicial_patron[7])
-                            escribir_valor_plc("MR8I", r_inicial_camara[7], cliente_plc)
-                            escribir_valor_plc("MP8I", r_inicial_patron[7], cliente_plc)
-                            rep_inicio_registrado[7] = True
-                            escribir_bandera_db74(2, True)
-                            logging.info("Repetición 8 inicio: MR8I=%.2f, MP8I=%.2f",
-                                         r_inicial_camara[7], r_inicial_patron[7])
-                    if rep_inicio_registrado[7] and (not rep_final_registrado[7]) and (v_camara >= thresholds[7]):
-                        r_final_camara[7] = v_camara
-                        r_final_patron[7] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                        dif_cam = r_final_camara[7] - r_inicial_camara[7]
-                        dif_pat = r_final_patron[7] - r_inicial_patron[7]
-                        guardar_evento("MR8F", "Camara", r_final_camara[7], r_inicial_camara[7], dif_cam)
-                        guardar_evento("MP8F", "Patron", r_final_patron[7], r_inicial_patron[7], dif_pat)
-                        escribir_valor_plc("MR8F", r_final_camara[7], cliente_plc)
-                        escribir_valor_plc("MP8F", r_final_patron[7], cliente_plc)
-                        rep_final_registrado[7] = True
-                        escribir_bandera_db74(2, False)
-                        logging.info("Repetición 8 final: MR8F=%.2f, MP8F=%.2f | difCam=%.2f, difPat=%.2f",
-                                     r_final_camara[7], r_final_patron[7], dif_cam, dif_pat)
+@app.route('/data', methods=['GET'])
+def get_data():
+    with LOCK:
+        data = LAST_CONFIRMED_VALUE.copy()
+    return jsonify(data)
 
-                # --- Repetición 9: Inicio y Final ---
-                if NUM_REPETICIONES >= 9:
-                    if (r_inicial_camara[7] is not None) and (not rep_inicio_registrado[8]):
-                        if v_camara >= (r_inicial_camara[7] + GAP):
-                            r_inicial_camara[8] = v_camara
-                            r_inicial_patron[8] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                            guardar_evento("MR9I", "Camara", r_inicial_camara[8], r_inicial_camara[8])
-                            guardar_evento("MP9I", "Patron", r_inicial_patron[8], r_inicial_patron[8])
-                            escribir_valor_plc("MR9I", r_inicial_camara[8], cliente_plc)
-                            escribir_valor_plc("MP9I", r_inicial_patron[8], cliente_plc)
-                            rep_inicio_registrado[8] = True
-                            escribir_bandera_db74(3, True)
-                            logging.info("Repetición 9 inicio: MR9I=%.2f, MP9I=%.2f",
-                                         r_inicial_camara[8], r_inicial_patron[8])
-                    if rep_inicio_registrado[8] and (not rep_final_registrado[8]) and (v_camara >= thresholds[8]):
-                        r_final_camara[8] = v_camara
-                        r_final_patron[8] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                        dif_cam = r_final_camara[8] - r_inicial_camara[8]
-                        dif_pat = r_final_patron[8] - r_inicial_patron[8]
-                        guardar_evento("MR9F", "Camara", r_final_camara[8], r_inicial_camara[8], dif_cam)
-                        guardar_evento("MP9F", "Patron", r_final_patron[8], r_inicial_patron[8], dif_pat)
-                        escribir_valor_plc("MR9F", r_final_camara[8], cliente_plc)
-                        escribir_valor_plc("MP9F", r_final_patron[8], cliente_plc)
-                        rep_final_registrado[8] = True
-                        escribir_bandera_db74(3, False)
-                        logging.info("Repetición 9 final: MR9F=%.2f, MP9F=%.2f | difCam=%.2f, difPat=%.2f",
-                                     r_final_camara[8], r_final_patron[8], dif_cam, dif_pat)
+@app.route('/stop', methods=['GET'])
+def stop_detection():
+    global DETECT_ACTIVE, LAST_CONFIRMED_VALUE
+    with LOCK:
+        DETECT_ACTIVE = False
+        for medidor in DETECTION_BUFFER:
+            DETECTION_BUFFER[medidor].clear()
+        for medidor in HISTORY:
+            HISTORY[medidor].clear()
+        LAST_CONFIRMED_VALUE["medidor"] = None
+        LAST_CONFIRMED_VALUE["value"] = None
+        print("[DEBUG] Detección detenida. LAST_CONFIRMED_VALUE reiniciado a None.")
+    return jsonify({'status': 'detección detenida y valores reseteados'})
 
-                # --- Repetición 10: Inicio y Final ---
-                if NUM_REPETICIONES >= 10:
-                    if (r_inicial_camara[8] is not None) and (not rep_inicio_registrado[9]):
-                        if v_camara >= (r_inicial_camara[8] + GAP):
-                            r_inicial_camara[9] = v_camara
-                            r_inicial_patron[9] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                            guardar_evento("MR10I", "Camara", r_inicial_camara[9], r_inicial_camara[9])
-                            guardar_evento("MP10I", "Patron", r_inicial_patron[9], r_inicial_patron[9])
-                            escribir_valor_plc("MR10I", r_inicial_camara[9], cliente_plc)
-                            escribir_valor_plc("MP10I", r_inicial_patron[9], cliente_plc)
-                            rep_inicio_registrado[9] = True
-                            escribir_bandera_db74(4, True)
-                            logging.info("Repetición 10 inicio: MR10I=%.2f, MP10I=%.2f",
-                                         r_inicial_camara[9], r_inicial_patron[9])
-                    if rep_inicio_registrado[9] and (not rep_final_registrado[9]) and (v_camara >= thresholds[9]):
-                        r_final_camara[9] = v_camara
-                        r_final_patron[9] = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-                        dif_cam = r_final_camara[9] - r_inicial_camara[9]
-                        dif_pat = r_final_patron[9] - r_inicial_patron[9]
-                        guardar_evento("MR10F", "Camara", r_final_camara[9], r_inicial_camara[9], dif_cam)
-                        guardar_evento("MP10F", "Patron", r_final_patron[9], r_inicial_patron[9], dif_pat)
-                        escribir_valor_plc("MR10F", r_final_camara[9], cliente_plc)
-                        escribir_valor_plc("MP10F", r_final_patron[9], cliente_plc)
-                        rep_final_registrado[9] = True
-                        escribir_bandera_db74(4, False)
-                        logging.info("Repetición 10 final: MR10F=%.2f, MP10F=%.2f | difCam=%.2f, difPat=%.2f",
-                                     r_final_camara[9], r_final_patron[9], dif_cam, dif_pat)
-
-                # Si todas las repeticiones solicitadas finalizaron, se envía FALSE en la bandera general
-                if all(rep_final_registrado[:NUM_REPETICIONES]):
-                    escribir_bandera_test(False)
-                    logging.info("Fin de calibración. Se pone la bandera general en FALSE.")
-                    break
-
-                time.sleep(0.1)
-        else:
-            time.sleep(0.3)
-
-# ------------------------------------------------------------------------------
-#                   FUNCIONES DE ARRANQUE Y CIERRE
-# ------------------------------------------------------------------------------
-def iniciar_hilos():
-    conectar_plc()
-    if conectado_plc:
-        bandera_inicial = leer_bandera_test()
-        patron_inicial = leer_dbd_real(PATTERN_DB, PATTERN_OFFSET)
-        setpoint_inicial = leer_dbd_int(SETPOINT_DB, SETPOINT_OFFSET)
-        logging.info("Al iniciar: bandera=%s, patrón=%s, setpoint=%s",
-                     bandera_inicial, patron_inicial, setpoint_inicial)
-
-    hilo_calibracion = threading.Thread(target=procesamiento_dato, daemon=True)
-    hilo_calibracion.start()
-
-def cerrar_conexion_plc():
-    if conectado_plc:
-        cliente_plc.disconnect()
-        logging.info("Conexión al PLC cerrada.")
-
-atexit.register(cerrar_conexion_plc)
-
-# ------------------------------------------------------------------------------
-#                   MAIN
-# ------------------------------------------------------------------------------
+###############################################################################
+#                                 MAIN                                      #
+###############################################################################
 if __name__ == '__main__':
-    iniciar_hilos()
-    app.run(host='0.0.0.0', port=5001, threaded=True)
+    try:
+        app.run(host='0.0.0.0', port=5000, threaded=True)
+    except KeyboardInterrupt:
+        print("Interrupción recibida. Cerrando aplicación.")
