@@ -142,7 +142,21 @@ def escribir_bandera_db74(rep: int, valor: bool):
     except Exception as e:
         logging.error(f"Error escribiendo bandera en DB{BANDERAS_DB}.DBX{BANDERAS_BYTE74}.{rep}: {e}")
 
+def apagar_bandera_db73(rep: int, timeout=0.2):
+    """Apaga la bandera en DB73 para la repetición rep y espera confirmación."""
+    escribir_bandera_db73(rep, False)
+    time.sleep(timeout)
+    data = cliente_plc.db_read(BANDERAS_DB, BANDERAS_BYTE73, 1)
+    estado = get_bool(data, 0, rep)
+    logging.info(f"Después de apagar, bandera DB73 bit {rep} = {estado}")
 
+def apagar_bandera_db74(rep: int, timeout=0.2):
+    """Apaga la bandera en DB74 para la repetición rep y espera confirmación."""
+    escribir_bandera_db74(rep, False)
+    time.sleep(timeout)
+    data = cliente_plc.db_read(BANDERAS_DB, BANDERAS_BYTE74, 1)
+    estado = get_bool(data, 0, rep)
+    logging.info(f"Después de apagar, bandera DB74 bit {rep} = {estado}")
 
 # ===============================================================================
 #                   FUNCIONES PARA CONEXIÓN Y LECTURA DEL PLC
@@ -384,7 +398,7 @@ def procesamiento_dato():
                             guardar_evento("MR2F", "Camara", r_final_camara[1], r_inicial_camara[1], dif_cam)
                             guardar_evento("MP2F", "Patron", r_final_patron[1], r_inicial_patron[1], dif_pat)
                             rep_final_registrado[1] = True
-                            escribir_bandera_db73(4, False)
+                            apagar_bandera_db73(4)
                             escribir_valor_plc("MR2F", r_final_camara[1], cliente_plc)
                             escribir_valor_plc("MP2F", r_final_patron[1], cliente_plc)
                             logging.info("Repetición 2 finalizada: MR2F=%.2f, MP2F=%.2f", r_final_camara[1], r_final_patron[1])
@@ -408,7 +422,7 @@ def procesamiento_dato():
                             guardar_evento("MR3F", "Camara", r_final_camara[2], r_inicial_camara[2], dif_cam)
                             guardar_evento("MP3F", "Patron", r_final_patron[2], r_inicial_patron[2], dif_pat)
                             rep_final_registrado[2] = True
-                            escribir_bandera_db73(5, False)
+                            apagar_bandera_db73(5)
                             escribir_valor_plc("MR3F", r_final_camara[2], cliente_plc)
                             escribir_valor_plc("MP3F", r_final_patron[2], cliente_plc)
                             logging.info("Repetición 3 finalizada: MR3F=%.2f, MP3F=%.2f", r_final_camara[2], r_final_patron[2])
@@ -432,7 +446,7 @@ def procesamiento_dato():
                             guardar_evento("MR4F", "Camara", r_final_camara[3], r_inicial_camara[3], dif_cam)
                             guardar_evento("MP4F", "Patron", r_final_patron[3], r_inicial_patron[3], dif_pat)
                             rep_final_registrado[3] = True
-                            escribir_bandera_db73(6, False)
+                            apagar_bandera_db73(6)
                             escribir_valor_plc("MR4F", r_final_camara[3], cliente_plc)
                             escribir_valor_plc("MP4F", r_final_patron[3], cliente_plc)
                             logging.info("Repetición 4 finalizada: MR4F=%.2f, MP4F=%.2f", r_final_camara[3], r_final_patron[3])
@@ -456,7 +470,7 @@ def procesamiento_dato():
                             guardar_evento("MR5F", "Camara", r_final_camara[4], r_inicial_camara[4], dif_cam)
                             guardar_evento("MP5F", "Patron", r_final_patron[4], r_inicial_patron[4], dif_pat)
                             rep_final_registrado[4] = True
-                            escribir_bandera_db73(7, False)
+                            apagar_bandera_db73(7)
                             escribir_valor_plc("MR5F", r_final_camara[4], cliente_plc)
                             escribir_valor_plc("MP5F", r_final_patron[4], cliente_plc)
                             logging.info("Repetición 5 finalizada: MR5F=%.2f, MP5F=%.2f", r_final_camara[4], r_final_patron[4])
@@ -480,7 +494,7 @@ def procesamiento_dato():
                             guardar_evento("MR6F", "Camara", r_final_camara[5], r_inicial_camara[5], dif_cam)
                             guardar_evento("MP6F", "Patron", r_final_patron[5], r_inicial_patron[5], dif_pat)
                             rep_final_registrado[5] = True
-                            escribir_bandera_db74(0, False)
+                            apagar_bandera_db74(0)
                             escribir_valor_plc("MR6F", r_final_camara[5], cliente_plc)
                             escribir_valor_plc("MP6F", r_final_patron[5], cliente_plc)
                             logging.info("Repetición 6 finalizada: MR6F=%.2f, MP6F=%.2f", r_final_camara[5], r_final_patron[5])
@@ -504,7 +518,7 @@ def procesamiento_dato():
                             guardar_evento("MR7F", "Camara", r_final_camara[6], r_inicial_camara[6], dif_cam)
                             guardar_evento("MP7F", "Patron", r_final_patron[6], r_inicial_patron[6], dif_pat)
                             rep_final_registrado[6] = True
-                            escribir_bandera_db74(1, False)
+                            apagar_bandera_db74(1)
                             escribir_valor_plc("MR7F", r_final_camara[6], cliente_plc)
                             escribir_valor_plc("MP7F", r_final_patron[6], cliente_plc)
                             logging.info("Repetición 7 finalizada: MR7F=%.2f, MP7F=%.2f", r_final_camara[6], r_final_patron[6])
@@ -528,7 +542,7 @@ def procesamiento_dato():
                             guardar_evento("MR8F", "Camara", r_final_camara[7], r_inicial_camara[7], dif_cam)
                             guardar_evento("MP8F", "Patron", r_final_patron[7], r_inicial_patron[7], dif_pat)
                             rep_final_registrado[7] = True
-                            escribir_bandera_db74(2, False)
+                            apagar_bandera_db74(2)
                             escribir_valor_plc("MR8F", r_final_camara[7], cliente_plc)
                             escribir_valor_plc("MP8F", r_final_patron[7], cliente_plc)
                             logging.info("Repetición 8 finalizada: MR8F=%.2f, MP8F=%.2f", r_final_camara[7], r_final_patron[7])
@@ -552,7 +566,7 @@ def procesamiento_dato():
                             guardar_evento("MR9F", "Camara", r_final_camara[8], r_inicial_camara[8], dif_cam)
                             guardar_evento("MP9F", "Patron", r_final_patron[8], r_inicial_patron[8], dif_pat)
                             rep_final_registrado[8] = True
-                            escribir_bandera_db74(3, False)
+                            apagar_bandera_db74(3)
                             escribir_valor_plc("MR9F", r_final_camara[8], cliente_plc)
                             escribir_valor_plc("MP9F", r_final_patron[8], cliente_plc)
                             logging.info("Repetición 9 finalizada: MR9F=%.2f, MP9F=%.2f", r_final_camara[8], r_final_patron[8])
@@ -576,7 +590,7 @@ def procesamiento_dato():
                             guardar_evento("MR10F", "Camara", r_final_camara[9], r_inicial_camara[9], dif_cam)
                             guardar_evento("MP10F", "Patron", r_final_patron[9], r_inicial_patron[9], dif_pat)
                             rep_final_registrado[9] = True
-                            escribir_bandera_db74(4, False)
+                            apagar_bandera_db74(4)
                             escribir_valor_plc("MR10F", r_final_camara[9], cliente_plc)
                             escribir_valor_plc("MP10F", r_final_patron[9], cliente_plc)
                             logging.info("Repetición 10 finalizada: MR10F=%.2f, MP10F=%.2f", r_final_camara[9], r_final_patron[9])
